@@ -340,8 +340,14 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                       history="window", window=5, llm=None, run_id=None, raw_dir=RAW_DIR,
                       cost_limit=None, episode_timeout=600, progress=True,
                       reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
-                      max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
+                      max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                      start_state=None, task="full", target_stage=7):
     """Every model response counts as one decision, whatever it contains.
+
+    start_state: start from this cube state instead of a `depth` scramble
+    (e.g. a stage task from tasks.make_stage_task). `task` labels the episode
+    in logs and the summary. The episode succeeds, and stops, once
+    stages_complete reaches `target_stage` (7 = solved).
 
     cost_limit (USD): stop once the episode's total cost goes over this.
     episode_timeout (s): wall-clock limit for the episode, including a call in
@@ -362,8 +368,11 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
     system = METHOD_PROMPT.read_text(encoding="utf-8")
 
     env = CubeEnv()
-    env.reset(depth, seed)
-    max_stage = stages_complete(env.state)
+    if start_state is None:
+        env.reset(depth, seed)
+    else:
+        env.restore(start_state)
+    start_stage = max_stage = stages_complete(env.state)
     decisions = quarter_turns = invalid = errors = reasoning_total = 0
     total_cost = 0.0
     total_latency = 0
@@ -376,8 +385,8 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
     with open(log_path, "w", encoding="utf-8") as log:
         while True:
             remaining = episode_timeout - (time.monotonic() - episode_start)
-            if is_solved(env.state):
-                stop_reason = "solved"
+            if stages_complete(env.state) >= target_stage:
+                stop_reason = "solved" if target_stage == 7 else "target_reached"
                 break
             if decisions >= max_decisions:
                 stop_reason = "max_decisions"
@@ -422,6 +431,7 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
             calls = reply.get("tool_calls") or []
             record = {
                 "run_id": run_id, "model": model, "condition": "B", "seed": seed,
+                "task": task, "start_stage": start_stage,
                 "decision": decisions, "tool": None, "arguments": None, "valid": None,
                 "stages_complete": stages_complete(env.state), "input_tokens": in_tok,
                 "output_tokens": out_tok, **extra_fields, "cost_usd": cost,
@@ -488,6 +498,10 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
     return {
         "run_id": run_id,
         "log_path": str(log_path),
+        "task": task,
+        "start_stage": start_stage,
+        "target_stage": target_stage,
+        "target_reached": max_stage >= target_stage,
         "solved": is_solved(env.state),
         "max_stage": max_stage,
         "final_stage": stages_complete(env.state),
@@ -546,7 +560,7 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
 
     env = CubeEnv()
     env.reset(depth, seed)
-    max_stage = stages_complete(env.state)
+    start_stage = max_stage = stages_complete(env.state)
     messages = [{"role": "system", "content": RAW_PROMPT.read_text(encoding="utf-8")},
                 {"role": "user", "content": observation(env.state)}]
 
@@ -581,7 +595,8 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         max_stage = max(max_stage, stages_complete(env.state))
 
     record = {
-        "run_id": run_id, "model": model, "condition": "A", "seed": seed, "decision": 1,
+        "run_id": run_id, "model": model, "condition": "A", "seed": seed,
+        "task": "full", "start_stage": start_stage, "decision": 1,
         "tool": None, "arguments": reply.get("content") if reply else None,
         "valid": reply is not None and stop_reason != "no_moves_line" and not bad,
         "invalid_tokens": bad, "stages_complete": stages_complete(env.state),
@@ -599,6 +614,10 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
     return {
         "run_id": run_id,
         "log_path": str(log_path),
+        "task": "full",
+        "start_stage": start_stage,
+        "target_stage": 7,
+        "target_reached": is_solved(env.state),
         "solved": is_solved(env.state),
         "max_stage": max_stage,
         "final_stage": stages_complete(env.state),

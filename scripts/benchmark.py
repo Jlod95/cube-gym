@@ -31,10 +31,12 @@ from harness import (  # noqa: E402
     run_episode_raw,
     run_episode_tools,
 )
+from tasks import make_stage_task, parse_tasks, task_stage  # noqa: E402
 
 RESULTS_DIR = ROOT / "results"
 RUN_PREFIX = "bench-"
-FIELDS = ["model", "condition", "history", "seed", "attempt", "run_id", "solved", "max_stage",
+FIELDS = ["model", "condition", "history", "task", "seed", "attempt", "run_id", "start_stage",
+          "target_stage", "target_reached", "solved", "max_stage",
           "final_stage", "decisions", "quarter_turns", "invalid", "errors", "reasoning_tokens", "reasoning_max_tokens",
           "max_output_tokens", "false_solved_claim",
           "total_cost_usd", "total_latency_ms", "stop_reason"]
@@ -53,21 +55,31 @@ def parse_seeds(text):
     return sorted(seeds)
 
 
-def episode_key(model, condition, history, seed, attempt, reasoning_max_tokens, max_output_tokens):
+def episode_key(model, condition, history, task, seed, attempt, reasoning_max_tokens,
+                max_output_tokens):
     """Budgets are part of the key: the same seed under another budget is a
     different episode, never skipped as already done."""
-    return (model, condition, history if condition == "B" else "-", seed, attempt,
+    return (model, condition, history if condition == "B" else "-", task, seed, attempt,
             reasoning_max_tokens, max_output_tokens)
 
 
 def row_key(r):
-    return episode_key(r["model"], r["condition"], r["history"], r["seed"], r["attempt"],
-                       r.get("reasoning_max_tokens"), r.get("max_output_tokens"))
+    return episode_key(r["model"], r["condition"], r["history"], r.get("task", "full"), r["seed"],
+                       r["attempt"], r.get("reasoning_max_tokens"), r.get("max_output_tokens"))
 
 
-def plan_episodes(models, conditions, seeds, k, history, reasoning_max_tokens, max_output_tokens):
-    return [episode_key(m, c, history, s, a, reasoning_max_tokens, max_output_tokens)
-            for m in models for c in conditions for s in seeds for a in range(1, k + 1)]
+def plan_episodes(models, conditions, seeds, k, history, reasoning_max_tokens, max_output_tokens,
+                  tasks=("full",), stage_seeds=()):
+    """Full tasks run in every condition on `seeds`; stage tasks run in
+    condition B only, on `stage_seeds`."""
+    plan = []
+    for m in models:
+        for task in tasks:
+            task_conditions = conditions if task == "full" else [c for c in conditions if c == "B"]
+            task_seeds = seeds if task == "full" else stage_seeds
+            plan += [episode_key(m, c, history, task, s, a, reasoning_max_tokens, max_output_tokens)
+                     for c in task_conditions for s in task_seeds for a in range(1, k + 1)]
+    return plan
 
 
 def read_raw_logs(raw_dir):
@@ -116,9 +128,9 @@ def write_summaries(rows, results_dir):
 
 def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR,
             episode_timeout=600, progress=True):
-    model, condition, history, seed, attempt, reasoning_max_tokens, max_output_tokens = key
-    run_id = (f"{RUN_PREFIX}{condition}-{model.replace('/', '_')}-{history}-s{seed}-k{attempt}"
-              f"-r{reasoning_max_tokens}-o{max_output_tokens}")
+    model, condition, history, task, seed, attempt, reasoning_max_tokens, max_output_tokens = key
+    run_id = (f"{RUN_PREFIX}{condition}-{model.replace('/', '_')}-{task}-{history}-s{seed}"
+              f"-k{attempt}-r{reasoning_max_tokens}-o{max_output_tokens}")
     budgets = {"reasoning_max_tokens": reasoning_max_tokens, "max_output_tokens": max_output_tokens}
     if condition == "A":
         return run_episode_raw(model, seed, depth=depth, llm=llm, run_id=run_id, raw_dir=raw_dir,
@@ -126,14 +138,22 @@ def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR,
     return run_episode_tools(model, seed, depth=depth, max_decisions=max_decisions,
                              history=history, llm=llm, run_id=run_id, raw_dir=raw_dir,
                              cost_limit=cost_limit, episode_timeout=episode_timeout,
-                             progress=progress, **budgets)
+                             progress=progress, **budgets, **task_args(task, seed))
+
+
+def task_args(task, seed):
+    stage = task_stage(task)
+    if stage is None:
+        return {"task": "full"}
+    return {"task": task, "start_state": make_stage_task(stage, seed), "target_stage": stage}
 
 
 def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, max_decisions=60,
                   max_cost=None, dry_run=False, results_dir=RESULTS_DIR, raw_dir=RAW_DIR,
                   llm_factory=None, out=print, episode_timeout=600, progress=True,
                   reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
-                  max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
+                  max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, tasks=("full",),
+                  stage_seeds=()):
     """llm_factory(model) -> llm lets tests run without the network."""
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +162,7 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
     completed = load_completed(episodes_path)
     done = {row_key(r) for r in completed}
     plan = plan_episodes(models, conditions, seeds, k, history, reasoning_max_tokens,
-                         max_output_tokens)
+                         max_output_tokens, tasks, stage_seeds)
     todo = [key for key in plan if key not in done]
 
     runs = read_raw_logs(raw_dir)
@@ -174,7 +194,7 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
         return completed
 
     for i, key in enumerate(todo, 1):
-        model, condition, history_, seed, attempt, *_ = key
+        model, condition, history_, task, seed, attempt, *_ = key
         est = estimates.get((model, condition))
         cost_limit = None
         if max_cost is not None:
@@ -191,8 +211,8 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
         summary = run_one(key, depth, max_decisions, cost_limit, llm=llm, raw_dir=raw_dir,
                           episode_timeout=episode_timeout, progress=progress)
         spent += summary["total_cost_usd"]
-        out(f"[{i}/{len(todo)}] {condition} {model} seed {seed} k{attempt}: "
-            f"solved={summary['solved']} max_stage={summary['max_stage']} "
+        out(f"[{i}/{len(todo)}] {condition} {task} {model} seed {seed} k{attempt}: "
+            f"target_reached={summary['target_reached']} max_stage={summary['max_stage']} "
             f"${summary['total_cost_usd']:.4f} ({summary['stop_reason']}); spent ${spent:.4f}")
 
         reason = summary["stop_reason"] or ""
@@ -201,7 +221,7 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
             break
 
         row = {"model": model, "condition": condition, "history": history_, "seed": seed,
-               "attempt": attempt, **summary}
+               "attempt": attempt, **summary}  # summary carries task, start_stage, ...
         with open(episodes_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(row) + "\n")
         completed.append(row)
@@ -219,7 +239,11 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", nargs="+", required=True)
     p.add_argument("--conditions", nargs="+", choices=["A", "B"], default=["A", "B"])
-    p.add_argument("--seeds", default="1-10", help="e.g. 1-10 or 1,3,5 or 1-3,7")
+    p.add_argument("--seeds", default="1-10", help="seeds for full tasks, e.g. 1-10 or 1,3,5")
+    p.add_argument("--tasks", default="full",
+                   help="full, stageN, stageN-M or a comma list, e.g. full,stage2-7 "
+                        "(stage tasks run in condition B only)")
+    p.add_argument("--stage-seeds", default="1-10", help="seeds for stage tasks")
     p.add_argument("--k", type=int, default=1, help="attempts per seed")
     p.add_argument("--history", choices=["window", "full"], default="window", help="condition B only")
     p.add_argument("--depth", type=int, default=25, help="scramble depth")
@@ -237,7 +261,8 @@ def main():
                   a.max_decisions, a.max_cost, a.dry_run,
                   episode_timeout=a.episode_timeout, progress=not a.quiet,
                   reasoning_max_tokens=a.reasoning_max_tokens,
-                  max_output_tokens=a.max_output_tokens)
+                  max_output_tokens=a.max_output_tokens, tasks=parse_tasks(a.tasks),
+                  stage_seeds=parse_seeds(a.stage_seeds))
 
 
 if __name__ == "__main__":
