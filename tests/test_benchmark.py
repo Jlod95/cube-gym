@@ -76,3 +76,17 @@ def test_max_cost_aborts_before_episode(tmp_path):
     # spend 0.5 + estimate for A (avg of 0.5) > 0.52
     assert "ABORT" in text
     assert rows == []
+
+
+def test_budgets_in_summary_and_part_of_resume_key(tmp_path):
+    rows, _ = run(tmp_path, conditions=["A"], seeds=[1], reasoning_max_tokens=1000,
+                  max_output_tokens=2000)
+    with open(tmp_path / "results" / "summary.csv", encoding="utf-8") as f:
+        row = next(csv.DictReader(f))
+    assert row["reasoning_max_tokens"] == "1000" and row["max_output_tokens"] == "2000"
+    assert "reasoning_tokens" in row
+
+    # Same seed under a different budget is a new episode, not skipped.
+    rows, text = run(tmp_path, conditions=["A"], seeds=[1])
+    assert "0 already done; 1 to run" in text
+    assert len(rows) == 2

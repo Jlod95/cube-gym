@@ -299,3 +299,120 @@ def test_progress_line_and_quiet(tmp_path, capsys):
 
     run(llm, tmp_path, depth=10, max_decisions=2, progress=False)
     assert capsys.readouterr().out == ""
+
+
+# --- reasoning and output budgets ------------------------------------------
+
+
+def fake_openai(monkeypatch, reasoning_tokens=700, completion_tokens=900, reject_reasoning=False,
+                tool=True):
+    """Patch openai.OpenAI with a fake whose create() records its kwargs."""
+    import httpx2 as httpx  # the HTTP library openai 3.x uses
+
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if reject_reasoning and "reasoning" in (kwargs.get("extra_body") or {}):
+            raise openai.BadRequestError(
+                "reasoning is not supported", body=None,
+                response=httpx.Response(400, request=httpx.Request("POST", "https://x")))
+        if tool and kwargs.get("tools"):
+            tool_calls = [SimpleNamespace(id="c1", function=SimpleNamespace(
+                name="turn", arguments='{"move": "U"}'))]
+            content = None
+        else:
+            tool_calls, content = None, "MOVES: U"
+        usage = SimpleNamespace(prompt_tokens=50, completion_tokens=completion_tokens, cost=0.001,
+                                completion_tokens_details=SimpleNamespace(
+                                    reasoning_tokens=reasoning_tokens))
+        choice = SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls),
+                                 finish_reason="tool_calls" if tool_calls else "stop")
+        return SimpleNamespace(choices=[choice], usage=usage)
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-test")
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    return calls
+
+
+def test_budgets_sent_in_every_request_both_conditions(tmp_path, monkeypatch):
+    calls = fake_openai(monkeypatch)
+    harness.run_episode_tools(MODEL, SEED, depth=10, max_decisions=3, raw_dir=tmp_path,
+                              reasoning_max_tokens=1500, max_output_tokens=3000, progress=False)
+    harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path,
+                            reasoning_max_tokens=1500, max_output_tokens=3000, progress=False)
+    assert len(calls) == 4
+    for kwargs in calls:
+        assert kwargs["max_tokens"] == 3000
+        assert kwargs["extra_body"] == {"reasoning": {"max_tokens": 1500}}
+
+
+def test_default_budgets(tmp_path, monkeypatch):
+    calls = fake_openai(monkeypatch)
+    harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path, progress=False)
+    assert calls[0]["max_tokens"] == 4000
+    assert calls[0]["extra_body"] == {"reasoning": {"max_tokens": 2000}}
+
+
+def test_zero_reasoning_asks_for_none_and_none_sends_nothing(tmp_path, monkeypatch):
+    calls = fake_openai(monkeypatch, reasoning_tokens=0)
+    harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path, reasoning_max_tokens=0, progress=False)
+    harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path, reasoning_max_tokens=None,
+                            max_output_tokens=None, progress=False)
+    assert calls[0]["extra_body"] == {"reasoning": {"effort": "none"}}
+    assert calls[1]["extra_body"] is None and "max_tokens" not in calls[1]
+
+
+def test_budgets_and_reasoning_tokens_in_every_log_line(tmp_path, monkeypatch):
+    fake_openai(monkeypatch, reasoning_tokens=700, completion_tokens=900)
+    summary = harness.run_episode_tools(MODEL, SEED, depth=10, max_decisions=3, raw_dir=tmp_path,
+                                        reasoning_max_tokens=1500, max_output_tokens=3000,
+                                        progress=False)
+    log = read_log(summary)
+    assert len(log) == 3
+    for rec in log:
+        assert rec["reasoning_max_tokens"] == 1500 and rec["max_output_tokens"] == 3000
+        assert rec["reasoning_tokens"] == 700 and rec["visible_output_tokens"] == 200
+        assert rec["output_tokens"] == 900
+        assert rec["reasoning_status"] == "ok"
+    assert summary["reasoning_tokens"] == 2100
+    assert summary["reasoning_max_tokens"] == 1500 and summary["max_output_tokens"] == 3000
+
+    raw = harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path, reasoning_max_tokens=1500,
+                                  max_output_tokens=3000, progress=False)
+    rec = read_log(raw)[0]
+    assert rec["reasoning_tokens"] == 700 and rec["reasoning_max_tokens"] == 1500
+    assert raw["reasoning_tokens"] == 700
+
+
+def test_rejected_reasoning_setting_is_logged_not_fatal(tmp_path, monkeypatch):
+    calls = fake_openai(monkeypatch, reject_reasoning=True)
+    summary = harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path, progress=False)
+    assert summary["stop_reason"] == "answered"
+    assert "reasoning" in calls[0]["extra_body"] and calls[1]["extra_body"] is None
+    assert calls[1]["max_tokens"] == 4000  # output cap still sent
+    assert read_log(summary)[0]["reasoning_status"].startswith("rejected: ")
+
+
+def test_ignored_reasoning_budget_is_logged(tmp_path, monkeypatch):
+    fake_openai(monkeypatch, reasoning_tokens=3500, completion_tokens=3600)
+    summary = harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path, progress=False)
+    assert read_log(summary)[0]["reasoning_status"] == "ignored: used 3500 > budget 2000"
+
+
+def test_unreported_reasoning_tokens(tmp_path, monkeypatch):
+    fake_openai(monkeypatch, reasoning_tokens=None)
+    summary = harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path, progress=False)
+    rec = read_log(summary)[0]
+    assert rec["reasoning_status"] == "not_reported" and rec["reasoning_tokens"] is None
+
+
+def test_output_cap_must_exceed_reasoning_budget():
+    import pytest
+
+    with pytest.raises(ValueError, match="must be larger"):
+        harness.run_episode_raw(MODEL, SEED, reasoning_max_tokens=4000, max_output_tokens=4000)

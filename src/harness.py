@@ -27,6 +27,8 @@ RAW_PROMPT = ROOT / "prompts" / "raw.md"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 MODELS_URL = OPENROUTER_BASE_URL + "/models"
 MAX_TIMES = 6
+DEFAULT_REASONING_MAX_TOKENS = 2000
+DEFAULT_MAX_OUTPUT_TOKENS = 4000
 
 TOOLS = [
     {
@@ -70,7 +72,7 @@ class DeadlineExceeded(Exception):
 def call_with_deadline(fn, seconds):
     """Run fn() but give up after `seconds` of wall-clock time.
 
-    The openai client's `timeout` is passed to httpx, where it limits each
+    The openai client's `timeout` is passed to its HTTP library (httpx2), where it limits each
     connect/read/write step, not the whole request: a server that keeps
     sending bytes (e.g. keep-alive whitespace while the model thinks) never
     trips it. This is a hard limit. On timeout the worker thread is abandoned
@@ -104,13 +106,25 @@ class OpenRouterLLM:
     A response that arrives but carries an error (no choices, or an error
     payload) is returned as {"error": ...} rather than raised, so the harness
     counts it as a decision.
+
+    Budgets sent with every request:
+      max_output_tokens -> `max_tokens` (covers reasoning + visible output)
+      reasoning_max_tokens -> `reasoning: {"max_tokens": N}`, or
+                              `{"effort": "none"}` when 0; None sends nothing.
+    If the provider rejects the reasoning setting (HTTP 400), the request is
+    resent without it and the reply's reasoning_status says "rejected: ...".
     """
 
-    def __init__(self, model, client=None, timeout=60, retries=3, backoff=2.0):
+    def __init__(self, model, client=None, timeout=60, retries=3, backoff=2.0,
+                 reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
+                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
+        check_budgets(reasoning_max_tokens, max_output_tokens)
         self.model = model
         self.timeout = timeout
         self.retries = retries
         self.backoff = backoff
+        self.reasoning_max_tokens = reasoning_max_tokens
+        self.max_output_tokens = max_output_tokens
         if client is None:
             from dotenv import load_dotenv
             from openai import OpenAI
@@ -129,33 +143,54 @@ class OpenRouterLLM:
         retryable = (openai.APIConnectionError, openai.APITimeoutError,
                      openai.RateLimitError, openai.InternalServerError, DeadlineExceeded)
         extra = {"tools": tools, "parallel_tool_calls": False} if tools else {}
+        if self.max_output_tokens is not None:
+            extra["max_tokens"] = self.max_output_tokens
+        body = {}
+        if self.reasoning_max_tokens is not None:
+            body["reasoning"] = ({"effort": "none"} if self.reasoning_max_tokens == 0
+                                 else {"max_tokens": self.reasoning_max_tokens})
+        rejected = None
 
         def request():
             return self.client.chat.completions.create(
-                model=self.model, messages=messages, timeout=self.timeout, **extra,
+                model=self.model, messages=messages, timeout=self.timeout,
+                extra_body=dict(body) or None, **extra,
             )
 
-        for attempt in range(self.retries + 1):
+        attempt = 0
+        while True:
             try:
                 resp = call_with_deadline(request, self.timeout)
                 break
+            except openai.BadRequestError as exc:
+                if "reasoning" not in body:
+                    raise
+                # Provider refused the reasoning setting: log it, resend without.
+                rejected = f"rejected: {str(exc)[:200]}"
+                body.pop("reasoning")
             except retryable:
                 if attempt == self.retries:
                     raise
                 time.sleep(self.backoff * 2 ** attempt)
+                attempt += 1
 
         usage = getattr(resp, "usage", None)
+        reasoning_tokens = getattr(getattr(usage, "completion_tokens_details", None),
+                                   "reasoning_tokens", None)
         usage_dict = {
             "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
             "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            "reasoning_tokens": reasoning_tokens,
             # OpenRouter reports cost in credits (1 credit = 1 USD).
             "cost": getattr(usage, "cost", None),
         } if usage is not None else None
+        status = rejected or reasoning_status(self.reasoning_max_tokens, reasoning_tokens)
+
         choices = getattr(resp, "choices", None)
         error = getattr(resp, "error", None)
         if error or not choices or getattr(choices[0], "message", None) is None:
             return {"error": str(error or "response had no message"), "content": None,
-                    "tool_calls": [], "usage": usage_dict}
+                    "tool_calls": [], "usage": usage_dict, "reasoning_status": status}
 
         msg = choices[0].message
         return {
@@ -165,7 +200,45 @@ class OpenRouterLLM:
                 for tc in (msg.tool_calls or [])
             ],
             "usage": usage_dict,
+            "finish_reason": getattr(choices[0], "finish_reason", None),
+            "reasoning_status": status,
         }
+
+
+def reasoning_status(budget, used):
+    """How the reasoning budget fared, judged from the reported token count."""
+    if budget is None:
+        return "not_sent"
+    if used is None:
+        return "not_reported"
+    if used > budget:
+        return f"ignored: used {used} > budget {budget}"
+    return "ok"
+
+
+def check_budgets(reasoning_max_tokens, max_output_tokens):
+    """max_tokens covers reasoning too, and Anthropic requires it to be strictly
+    larger than the reasoning budget."""
+    if (reasoning_max_tokens is not None and max_output_tokens is not None
+            and reasoning_max_tokens >= max_output_tokens):
+        raise ValueError(f"max_output_tokens ({max_output_tokens}) must be larger than "
+                         f"reasoning_max_tokens ({reasoning_max_tokens})")
+
+
+def reasoning_fields(reply, reasoning_max_tokens, max_output_tokens):
+    """Per-call log fields: reasoning tokens apart from other output, the
+    budgets in force, and whether the reasoning setting took effect."""
+    usage = reply.get("usage") or {}
+    reasoning = usage.get("reasoning_tokens")
+    output = usage.get("output_tokens", 0)
+    return {
+        "reasoning_tokens": reasoning,
+        "visible_output_tokens": output - (reasoning or 0),
+        "reasoning_status": reply.get("reasoning_status"),
+        "finish_reason": reply.get("finish_reason"),
+        "reasoning_max_tokens": reasoning_max_tokens,
+        "max_output_tokens": max_output_tokens,
+    }
 
 
 _PRICES = {}
@@ -265,17 +338,23 @@ def progress_line(model, seed, decision, action, stages, cost):
 
 def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns=300,
                       history="window", window=5, llm=None, run_id=None, raw_dir=RAW_DIR,
-                      cost_limit=None, episode_timeout=600, progress=True):
+                      cost_limit=None, episode_timeout=600, progress=True,
+                      reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
+                      max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
     """Every model response counts as one decision, whatever it contains.
 
     cost_limit (USD): stop once the episode's total cost goes over this.
     episode_timeout (s): wall-clock limit for the episode, including a call in
     progress; when hit, the episode ends with stop_reason "timeout".
     progress: print one short line per decision.
+    reasoning_max_tokens / max_output_tokens: budgets sent with every request
+    (see OpenRouterLLM) and recorded in every log line.
     """
     if history not in ("window", "full"):
         raise ValueError(f"history must be 'window' or 'full', got {history!r}")
-    llm = llm or OpenRouterLLM(model)
+    check_budgets(reasoning_max_tokens, max_output_tokens)
+    llm = llm or OpenRouterLLM(model, reasoning_max_tokens=reasoning_max_tokens,
+                               max_output_tokens=max_output_tokens)
     run_id = run_id or f"B_{model.replace('/', '_')}_s{seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -285,7 +364,7 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
     env = CubeEnv()
     env.reset(depth, seed)
     max_stage = stages_complete(env.state)
-    decisions = quarter_turns = invalid = errors = 0
+    decisions = quarter_turns = invalid = errors = reasoning_total = 0
     total_cost = 0.0
     total_latency = 0
     false_claim = False
@@ -337,14 +416,16 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
 
             in_tok, out_tok, cost, cost_source = reply_cost(model, reply)
             total_cost += cost or 0.0
+            extra_fields = reasoning_fields(reply, reasoning_max_tokens, max_output_tokens)
+            reasoning_total += extra_fields["reasoning_tokens"] or 0
 
             calls = reply.get("tool_calls") or []
             record = {
                 "run_id": run_id, "model": model, "condition": "B", "seed": seed,
                 "decision": decisions, "tool": None, "arguments": None, "valid": None,
                 "stages_complete": stages_complete(env.state), "input_tokens": in_tok,
-                "output_tokens": out_tok, "cost_usd": cost, "cost_source": cost_source,
-                "latency_ms": latency_ms,
+                "output_tokens": out_tok, **extra_fields, "cost_usd": cost,
+                "cost_source": cost_source, "latency_ms": latency_ms,
             }
 
             if failure or reply.get("error"):
@@ -414,6 +495,9 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
         "quarter_turns": quarter_turns,
         "invalid": invalid,
         "errors": errors,
+        "reasoning_tokens": reasoning_total,
+        "reasoning_max_tokens": reasoning_max_tokens,
+        "max_output_tokens": max_output_tokens,
         "false_solved_claim": false_claim,
         "total_cost_usd": total_cost,
         "total_latency_ms": total_latency,
@@ -446,11 +530,15 @@ def parse_moves_reply(text):
 
 
 def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
-                    run_id=None, raw_dir=RAW_DIR, episode_timeout=600, progress=True):
+                    run_id=None, raw_dir=RAW_DIR, episode_timeout=600, progress=True,
+                    reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
+                    max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
     """Condition A: raw prompt, no tools, one call. Invalid tokens are skipped
     and counted; at most max_quarter_turns moves are applied. The one call
     counts as the one decision, even if it fails."""
-    llm = llm or OpenRouterLLM(model)
+    check_budgets(reasoning_max_tokens, max_output_tokens)
+    llm = llm or OpenRouterLLM(model, reasoning_max_tokens=reasoning_max_tokens,
+                               max_output_tokens=max_output_tokens)
     run_id = run_id or f"A_{model.replace('/', '_')}_s{seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -464,8 +552,10 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
 
     start = time.perf_counter()
     error = None
+    extra_fields = reasoning_fields({}, reasoning_max_tokens, max_output_tokens)
     try:
         reply = call_with_deadline(lambda: llm(messages, None), episode_timeout)
+        extra_fields = reasoning_fields(reply, reasoning_max_tokens, max_output_tokens)
         if reply.get("error"):
             reply, error, stop_reason = None, reply["error"], "error_response"
     except DeadlineExceeded:
@@ -495,7 +585,7 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "tool": None, "arguments": reply.get("content") if reply else None,
         "valid": reply is not None and stop_reason != "no_moves_line" and not bad,
         "invalid_tokens": bad, "stages_complete": stages_complete(env.state),
-        "input_tokens": in_tok, "output_tokens": out_tok, "cost_usd": cost,
+        "input_tokens": in_tok, "output_tokens": out_tok, **extra_fields, "cost_usd": cost,
         "cost_source": cost_source, "latency_ms": latency_ms,
     }
     if error:
@@ -516,6 +606,9 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "quarter_turns": len(moves),
         "invalid": len(bad) + (stop_reason == "no_moves_line"),
         "errors": int(error is not None),
+        "reasoning_tokens": extra_fields["reasoning_tokens"] or 0,
+        "reasoning_max_tokens": reasoning_max_tokens,
+        "max_output_tokens": max_output_tokens,
         "false_solved_claim": False,
         "total_cost_usd": cost or 0.0,
         "total_latency_ms": latency_ms,

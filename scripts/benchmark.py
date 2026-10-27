@@ -23,12 +23,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from harness import RAW_DIR, ROOT, run_episode_raw, run_episode_tools  # noqa: E402
+from harness import (  # noqa: E402
+    DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_REASONING_MAX_TOKENS,
+    RAW_DIR,
+    ROOT,
+    run_episode_raw,
+    run_episode_tools,
+)
 
 RESULTS_DIR = ROOT / "results"
 RUN_PREFIX = "bench-"
 FIELDS = ["model", "condition", "history", "seed", "attempt", "run_id", "solved", "max_stage",
-          "final_stage", "decisions", "quarter_turns", "invalid", "errors", "false_solved_claim",
+          "final_stage", "decisions", "quarter_turns", "invalid", "errors", "reasoning_tokens", "reasoning_max_tokens",
+          "max_output_tokens", "false_solved_claim",
           "total_cost_usd", "total_latency_ms", "stop_reason"]
 
 
@@ -45,12 +53,20 @@ def parse_seeds(text):
     return sorted(seeds)
 
 
-def episode_key(model, condition, history, seed, attempt):
-    return (model, condition, history if condition == "B" else "-", seed, attempt)
+def episode_key(model, condition, history, seed, attempt, reasoning_max_tokens, max_output_tokens):
+    """Budgets are part of the key: the same seed under another budget is a
+    different episode, never skipped as already done."""
+    return (model, condition, history if condition == "B" else "-", seed, attempt,
+            reasoning_max_tokens, max_output_tokens)
 
 
-def plan_episodes(models, conditions, seeds, k, history):
-    return [episode_key(m, c, history, s, a)
+def row_key(r):
+    return episode_key(r["model"], r["condition"], r["history"], r["seed"], r["attempt"],
+                       r.get("reasoning_max_tokens"), r.get("max_output_tokens"))
+
+
+def plan_episodes(models, conditions, seeds, k, history, reasoning_max_tokens, max_output_tokens):
+    return [episode_key(m, c, history, s, a, reasoning_max_tokens, max_output_tokens)
             for m in models for c in conditions for s in seeds for a in range(1, k + 1)]
 
 
@@ -100,35 +116,40 @@ def write_summaries(rows, results_dir):
 
 def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR,
             episode_timeout=600, progress=True):
-    model, condition, history, seed, attempt = key
-    run_id = f"{RUN_PREFIX}{condition}-{model.replace('/', '_')}-{history}-s{seed}-k{attempt}"
+    model, condition, history, seed, attempt, reasoning_max_tokens, max_output_tokens = key
+    run_id = (f"{RUN_PREFIX}{condition}-{model.replace('/', '_')}-{history}-s{seed}-k{attempt}"
+              f"-r{reasoning_max_tokens}-o{max_output_tokens}")
+    budgets = {"reasoning_max_tokens": reasoning_max_tokens, "max_output_tokens": max_output_tokens}
     if condition == "A":
         return run_episode_raw(model, seed, depth=depth, llm=llm, run_id=run_id, raw_dir=raw_dir,
-                               episode_timeout=episode_timeout, progress=progress)
+                               episode_timeout=episode_timeout, progress=progress, **budgets)
     return run_episode_tools(model, seed, depth=depth, max_decisions=max_decisions,
                              history=history, llm=llm, run_id=run_id, raw_dir=raw_dir,
                              cost_limit=cost_limit, episode_timeout=episode_timeout,
-                             progress=progress)
+                             progress=progress, **budgets)
 
 
 def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, max_decisions=60,
                   max_cost=None, dry_run=False, results_dir=RESULTS_DIR, raw_dir=RAW_DIR,
-                  llm_factory=None, out=print, episode_timeout=600, progress=True):
+                  llm_factory=None, out=print, episode_timeout=600, progress=True,
+                  reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
+                  max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
     """llm_factory(model) -> llm lets tests run without the network."""
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     episodes_path = results_dir / "episodes.jsonl"
 
     completed = load_completed(episodes_path)
-    done = {episode_key(r["model"], r["condition"], r["history"], r["seed"], r["attempt"])
-            for r in completed}
-    plan = plan_episodes(models, conditions, seeds, k, history)
+    done = {row_key(r) for r in completed}
+    plan = plan_episodes(models, conditions, seeds, k, history, reasoning_max_tokens,
+                         max_output_tokens)
     todo = [key for key in plan if key not in done]
 
     runs = read_raw_logs(raw_dir)
     estimates = cost_estimates(runs)
     spent = benchmark_spend(runs)
 
+    out(f"budgets: reasoning_max_tokens={reasoning_max_tokens}, max_output_tokens={max_output_tokens}")
     out(f"planned {len(plan)} episodes; {len(plan) - len(todo)} already done; {len(todo)} to run")
     if dry_run:
         groups = defaultdict(int)
@@ -153,7 +174,7 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
         return completed
 
     for i, key in enumerate(todo, 1):
-        model, condition, history_, seed, attempt = key
+        model, condition, history_, seed, attempt, *_ = key
         est = estimates.get((model, condition))
         cost_limit = None
         if max_cost is not None:
@@ -190,6 +211,10 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
     return completed
 
 
+def token_budget(text):
+    return None if text.lower() == "none" else int(text)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", nargs="+", required=True)
@@ -203,10 +228,16 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--episode-timeout", type=float, default=600, help="seconds per episode")
     p.add_argument("--quiet", action="store_true", help="no per-decision progress lines")
+    p.add_argument("--reasoning-max-tokens", type=token_budget, default=DEFAULT_REASONING_MAX_TOKENS,
+                   help="reasoning budget per call; 0 asks for no reasoning, 'none' sends no setting")
+    p.add_argument("--max-output-tokens", type=token_budget, default=DEFAULT_MAX_OUTPUT_TOKENS,
+                   help="output cap per call, reasoning included; 'none' sends no cap")
     a = p.parse_args()
     run_benchmark(a.models, a.conditions, parse_seeds(a.seeds), a.k, a.history, a.depth,
                   a.max_decisions, a.max_cost, a.dry_run,
-                  episode_timeout=a.episode_timeout, progress=not a.quiet)
+                  episode_timeout=a.episode_timeout, progress=not a.quiet,
+                  reasoning_max_tokens=a.reasoning_max_tokens,
+                  max_output_tokens=a.max_output_tokens)
 
 
 if __name__ == "__main__":
