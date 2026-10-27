@@ -82,7 +82,8 @@ Turns one face a quarter turn. Moves: `U U' D D' L L' R R' F F' B B'`.
 
 ### apply_algorithm(name, front, times)
 
-Performs a named algorithm `times` times in a row (default 1).
+Performs a named algorithm `times` times in a row. `times` is a whole number
+from 1 to 6 (default 1); any other value is rejected as an invalid action.
 
 - **front** is one of `green`, `orange`, `blue`, `red`, the colour of a side
   centre. The algorithm is performed as if that colour faces you. "Front",
@@ -104,6 +105,20 @@ Performs a named algorithm `times` times in a row (default 1).
 | swap_edges | R U R' U R U2 R' U | 5 | Swaps the top front and top left edges. The top back and top right edges stay in place. Keeps yellow edges facing up. |
 | cycle_corners | U R U' L' U R' U' L | 6 | Keeps the top front-right corner in place and cycles the other three top corners. Keeps the top edges intact. |
 | twist_corner | R' D' R D | 7 | Twists the top front-right corner in place. It scrambles the lower layers along the way. |
+
+## Rules for each turn
+
+- **One tool call per turn.** Only your first tool call is carried out; any
+  others in the same reply are rejected and not run.
+- **Replying without a tool call ends the episode.** Don't stop to explain or
+  ask questions; keep calling tools until the cube is solved. Only reply with
+  plain text if you are giving up, and don't claim the cube is solved unless it
+  is.
+- **Limits.** You have at most 60 actions (tool calls) and 300 quarter turns in
+  total. An algorithm counts one quarter turn per move, times `times`. The
+  episode ends when either limit is reached.
+- Invalid tool calls (unknown move, algorithm, front or `times`) still use up an
+  action. They return an error message and leave the cube unchanged.
 
 ## How to do each stage
 
