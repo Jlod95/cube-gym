@@ -11,6 +11,7 @@ OpenRouterLLM is the real one; tests pass in fakes.
 import json
 import os
 import re
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,11 +63,47 @@ TOOLS = [
 # --- the real model -------------------------------------------------------
 
 
+class DeadlineExceeded(Exception):
+    pass
+
+
+def call_with_deadline(fn, seconds):
+    """Run fn() but give up after `seconds` of wall-clock time.
+
+    The openai client's `timeout` is passed to httpx, where it limits each
+    connect/read/write step, not the whole request: a server that keeps
+    sending bytes (e.g. keep-alive whitespace while the model thinks) never
+    trips it. This is a hard limit. On timeout the worker thread is abandoned
+    (it is a daemon, so it cannot keep the process alive).
+    """
+    result = {}
+
+    def target():
+        try:
+            result["value"] = fn()
+        except BaseException as exc:  # re-raised in the caller's thread
+            result["error"] = exc
+
+    worker = threading.Thread(target=target, daemon=True)
+    worker.start()
+    worker.join(max(seconds, 0))
+    if worker.is_alive():
+        raise DeadlineExceeded(f"no response within {seconds:.0f} s")
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 class OpenRouterLLM:
-    """Calls OpenRouter with a 60 s timeout and up to 3 retries with backoff.
+    """Calls OpenRouter with a hard 60 s wall-clock timeout per attempt and up
+    to 3 retries with backoff.
 
     The API key is read from .env / the environment and only ever passed to
     the client; it is never stored in logs or returned.
+
+    A response that arrives but carries an error (no choices, or an error
+    payload) is returned as {"error": ...} rather than raised, so the harness
+    counts it as a decision.
     """
 
     def __init__(self, model, client=None, timeout=60, retries=3, backoff=2.0):
@@ -90,33 +127,44 @@ class OpenRouterLLM:
         import openai
 
         retryable = (openai.APIConnectionError, openai.APITimeoutError,
-                     openai.RateLimitError, openai.InternalServerError)
+                     openai.RateLimitError, openai.InternalServerError, DeadlineExceeded)
         extra = {"tools": tools, "parallel_tool_calls": False} if tools else {}
+
+        def request():
+            return self.client.chat.completions.create(
+                model=self.model, messages=messages, timeout=self.timeout, **extra,
+            )
+
         for attempt in range(self.retries + 1):
             try:
-                resp = self.client.chat.completions.create(
-                    model=self.model, messages=messages, timeout=self.timeout, **extra,
-                )
+                resp = call_with_deadline(request, self.timeout)
                 break
             except retryable:
                 if attempt == self.retries:
                     raise
                 time.sleep(self.backoff * 2 ** attempt)
 
-        msg = resp.choices[0].message
-        usage = resp.usage
+        usage = getattr(resp, "usage", None)
+        usage_dict = {
+            "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            # OpenRouter reports cost in credits (1 credit = 1 USD).
+            "cost": getattr(usage, "cost", None),
+        } if usage is not None else None
+        choices = getattr(resp, "choices", None)
+        error = getattr(resp, "error", None)
+        if error or not choices or getattr(choices[0], "message", None) is None:
+            return {"error": str(error or "response had no message"), "content": None,
+                    "tool_calls": [], "usage": usage_dict}
+
+        msg = choices[0].message
         return {
             "content": msg.content,
             "tool_calls": [
                 {"id": tc.id, "name": tc.function.name, "arguments": tc.function.arguments}
                 for tc in (msg.tool_calls or [])
             ],
-            "usage": {
-                "input_tokens": getattr(usage, "prompt_tokens", 0) or 0,
-                "output_tokens": getattr(usage, "completion_tokens", 0) or 0,
-                # OpenRouter reports cost in credits (1 credit = 1 USD).
-                "cost": getattr(usage, "cost", None),
-            },
+            "usage": usage_dict,
         }
 
 
@@ -139,7 +187,9 @@ def price_cost(model, input_tokens, output_tokens):
 
 def reply_cost(model, reply):
     """(input_tokens, output_tokens, cost_usd, cost_source) for one reply."""
-    usage = reply.get("usage") or {}
+    usage = reply.get("usage")
+    if not usage:
+        return 0, 0, 0.0, "none"
     in_tok, out_tok = usage.get("input_tokens", 0), usage.get("output_tokens", 0)
     if usage.get("cost") is not None:
         return in_tok, out_tok, usage["cost"], "api"
@@ -202,10 +252,27 @@ def claims_solved(text):
 # --- episode loop ---------------------------------------------------------
 
 
+def write_line(log, record):
+    """Append one JSON line and push it to disk immediately."""
+    log.write(json.dumps(record) + "\n")
+    log.flush()
+    os.fsync(log.fileno())
+
+
+def progress_line(model, seed, decision, action, stages, cost):
+    print(f"[{model} s{seed}] #{decision} {action} | stages {stages}/7 | ${cost:.4f}", flush=True)
+
+
 def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns=300,
                       history="window", window=5, llm=None, run_id=None, raw_dir=RAW_DIR,
-                      cost_limit=None):
-    """cost_limit (USD): stop the episode once its total cost goes over this."""
+                      cost_limit=None, episode_timeout=600, progress=True):
+    """Every model response counts as one decision, whatever it contains.
+
+    cost_limit (USD): stop once the episode's total cost goes over this.
+    episode_timeout (s): wall-clock limit for the episode, including a call in
+    progress; when hit, the episode ends with stop_reason "timeout".
+    progress: print one short line per decision.
+    """
     if history not in ("window", "full"):
         raise ValueError(f"history must be 'window' or 'full', got {history!r}")
     llm = llm or OpenRouterLLM(model)
@@ -218,16 +285,18 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
     env = CubeEnv()
     env.reset(depth, seed)
     max_stage = stages_complete(env.state)
-    decisions = quarter_turns = invalid = 0
+    decisions = quarter_turns = invalid = errors = 0
     total_cost = 0.0
     total_latency = 0
     false_claim = False
     stop_reason = None
     recent = []  # (action, result) pairs for window history
     conversation = [{"role": "user", "content": state_text(env.state)}]  # full history
+    episode_start = time.monotonic()
 
     with open(log_path, "w", encoding="utf-8") as log:
         while True:
+            remaining = episode_timeout - (time.monotonic() - episode_start)
             if is_solved(env.state):
                 stop_reason = "solved"
                 break
@@ -239,6 +308,9 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                 break
             if cost_limit is not None and total_cost > cost_limit:
                 stop_reason = "cost_limit"
+                break
+            if remaining <= 0:
+                stop_reason = "timeout"
                 break
 
             if history == "full":
@@ -253,12 +325,13 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
 
             decisions += 1
             start = time.perf_counter()
+            failure = None
             try:
-                reply = llm(messages, TOOLS)
+                reply = call_with_deadline(lambda: llm(messages, TOOLS), remaining)
+            except DeadlineExceeded:
+                reply, failure = {}, "timeout"
             except Exception as exc:  # API failure after retries: end the episode, don't crash
-                stop_reason = f"api_error: {type(exc).__name__}"
-                decisions -= 1
-                break
+                reply, failure = {}, f"api_error: {type(exc).__name__}"
             latency_ms = round((time.perf_counter() - start) * 1000)
             total_latency += latency_ms
 
@@ -269,16 +342,35 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
             record = {
                 "run_id": run_id, "model": model, "condition": "B", "seed": seed,
                 "decision": decisions, "tool": None, "arguments": None, "valid": None,
-                "stages_complete": None, "input_tokens": in_tok, "output_tokens": out_tok,
-                "cost_usd": cost, "cost_source": cost_source, "latency_ms": latency_ms,
+                "stages_complete": stages_complete(env.state), "input_tokens": in_tok,
+                "output_tokens": out_tok, "cost_usd": cost, "cost_source": cost_source,
+                "latency_ms": latency_ms,
             }
+
+            if failure or reply.get("error"):
+                # No usable response: log it as a decision. A transport failure
+                # or the episode deadline ends the episode; an error response
+                # does not, but still uses up a decision.
+                errors += 1
+                record["error"] = failure or reply["error"]
+                write_line(log, record)
+                if progress:
+                    progress_line(model, seed, decisions, f"ERROR {record['error']}",
+                                  record["stages_complete"], total_cost)
+                if failure:
+                    stop_reason = failure
+                    break
+                recent.append(("(no action)", f"API error: {reply['error']}"))
+                continue
 
             if not calls:
                 false_claim = claims_solved(reply.get("content")) and not is_solved(env.state)
-                record["stages_complete"] = stages_complete(env.state)
                 record["final_reply"] = reply.get("content")
                 record["false_solved_claim"] = false_claim
-                log.write(json.dumps(record) + "\n")
+                write_line(log, record)
+                if progress:
+                    progress_line(model, seed, decisions, "(text reply, no tool call)",
+                                  record["stages_complete"], total_cost)
                 stop_reason = "no_tool_call"
                 break
 
@@ -293,9 +385,12 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                           stages_complete=stages)
             if len(calls) > 1:
                 record["ignored_tool_calls"] = len(calls) - 1
-            log.write(json.dumps(record) + "\n")
+            write_line(log, record)
 
             action = f"{call['name']}({call['arguments']})"
+            if progress:
+                progress_line(model, seed, decisions, action + ("" if valid else " INVALID"),
+                              stages, total_cost)
             recent.append((action, f"{result} {stage_line(env.state)}"))
             conversation.append({
                 "role": "assistant", "content": reply.get("content"),
@@ -318,6 +413,7 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
         "decisions": decisions,
         "quarter_turns": quarter_turns,
         "invalid": invalid,
+        "errors": errors,
         "false_solved_claim": false_claim,
         "total_cost_usd": total_cost,
         "total_latency_ms": total_latency,
@@ -350,9 +446,10 @@ def parse_moves_reply(text):
 
 
 def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
-                    run_id=None, raw_dir=RAW_DIR):
+                    run_id=None, raw_dir=RAW_DIR, episode_timeout=600, progress=True):
     """Condition A: raw prompt, no tools, one call. Invalid tokens are skipped
-    and counted; at most max_quarter_turns moves are applied."""
+    and counted; at most max_quarter_turns moves are applied. The one call
+    counts as the one decision, even if it fails."""
     llm = llm or OpenRouterLLM(model)
     run_id = run_id or f"A_{model.replace('/', '_')}_s{seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
     raw_dir = Path(raw_dir)
@@ -366,10 +463,16 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
                 {"role": "user", "content": observation(env.state)}]
 
     start = time.perf_counter()
+    error = None
     try:
-        reply = llm(messages, None)
+        reply = call_with_deadline(lambda: llm(messages, None), episode_timeout)
+        if reply.get("error"):
+            reply, error, stop_reason = None, reply["error"], "error_response"
+    except DeadlineExceeded:
+        reply, error, stop_reason = None, "timeout", "timeout"
     except Exception as exc:  # API failure after retries
         reply, stop_reason = None, f"api_error: {type(exc).__name__}"
+        error = stop_reason
     latency_ms = round((time.perf_counter() - start) * 1000)
 
     in_tok = out_tok = 0
@@ -395,8 +498,13 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "input_tokens": in_tok, "output_tokens": out_tok, "cost_usd": cost,
         "cost_source": cost_source, "latency_ms": latency_ms,
     }
+    if error:
+        record["error"] = error
     with open(log_path, "w", encoding="utf-8") as log:
-        log.write(json.dumps(record) + "\n")
+        write_line(log, record)
+    if progress:
+        action = f"MOVES ({len(moves)} quarter turns)" if reply else f"ERROR {error}"
+        progress_line(model, seed, 1, action, record["stages_complete"], cost or 0.0)
 
     return {
         "run_id": run_id,
@@ -404,9 +512,10 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "solved": is_solved(env.state),
         "max_stage": max_stage,
         "final_stage": stages_complete(env.state),
-        "decisions": 1 if reply is not None else 0,
+        "decisions": 1,
         "quarter_turns": len(moves),
         "invalid": len(bad) + (stop_reason == "no_moves_line"),
+        "errors": int(error is not None),
         "false_solved_claim": False,
         "total_cost_usd": cost or 0.0,
         "total_latency_ms": latency_ms,

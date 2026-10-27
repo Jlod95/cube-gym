@@ -191,3 +191,111 @@ def test_cost_limit_stops_episode(tmp_path):
     summary = run(llm, tmp_path, depth=10, cost_limit=0.0025)
     assert summary["stop_reason"] == "cost_limit"
     assert summary["decisions"] == 3  # 0.003 > 0.0025 after the third call
+
+
+# --- hang fixes: decisions always counted, flushing, deadlines, progress ----
+
+
+def test_never_stopping_llm_ends_at_max_decisions(tmp_path):
+    llm = ScriptedLLM([tool_reply("turn", move="U")])  # calls a tool forever
+    summary = run(llm, tmp_path, depth=10)  # default max_decisions=60
+
+    assert summary["stop_reason"] == "max_decisions"
+    assert summary["decisions"] == 60
+    assert len(llm.calls) == 60
+    assert len(read_log(summary)) == 60
+
+
+def test_error_responses_count_as_decisions(tmp_path):
+    llm = ScriptedLLM([{"error": "provider returned error", "content": None,
+                        "tool_calls": [], "usage": None}])
+    summary = run(llm, tmp_path, depth=10, max_decisions=5)
+
+    assert summary["stop_reason"] == "max_decisions"
+    assert summary["decisions"] == 5 and summary["errors"] == 5
+    assert [r["error"] for r in read_log(summary)] == ["provider returned error"] * 5
+
+
+def test_invalid_calls_count_as_decisions(tmp_path):
+    llm = ScriptedLLM([tool_reply("turn", move="nope")])
+    summary = run(llm, tmp_path, depth=10, max_decisions=4)
+    assert summary["stop_reason"] == "max_decisions"
+    assert summary["decisions"] == summary["invalid"] == 4
+
+
+def test_each_log_line_is_on_disk_before_the_next_call(tmp_path):
+    seen = []
+
+    def llm(messages, tools):
+        seen.append(len((tmp_path / "flush.jsonl").read_text(encoding="utf-8").splitlines()))
+        return tool_reply("turn", move="U")
+
+    run(llm, tmp_path, depth=10, max_decisions=4, run_id="flush")
+    assert seen == [0, 1, 2, 3]
+
+
+def test_episode_wall_clock_timeout(tmp_path):
+    import time
+
+    def slow_llm(messages, tools):
+        time.sleep(5)
+        return tool_reply("turn", move="U")
+
+    start = time.monotonic()
+    summary = run(slow_llm, tmp_path, depth=10, episode_timeout=0.3)
+    assert time.monotonic() - start < 2
+    assert summary["stop_reason"] == "timeout"
+    assert read_log(summary)[-1]["error"] == "timeout"
+
+
+def test_raw_condition_wall_clock_timeout(tmp_path):
+    import time
+
+    def slow_llm(messages, tools):
+        time.sleep(5)
+
+    summary = harness.run_episode_raw(MODEL, SEED, llm=slow_llm, raw_dir=tmp_path,
+                                      episode_timeout=0.3)
+    assert summary["stop_reason"] == "timeout"
+    assert summary["decisions"] == 1
+
+
+def test_openrouter_call_has_hard_deadline():
+    """A request that never finishes (e.g. a server sending keep-alive bytes,
+    which the httpx read timeout doesn't catch) is cut off by wall clock."""
+    import time
+
+    import pytest
+
+    kwargs_seen = []
+
+    def create(**kwargs):
+        kwargs_seen.append(kwargs)
+        time.sleep(5)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    llm = harness.OpenRouterLLM(MODEL, client=client, timeout=0.2, retries=1, backoff=0)
+    start = time.monotonic()
+    with pytest.raises(harness.DeadlineExceeded):
+        llm([], [])
+    assert time.monotonic() - start < 1.5
+    assert len(kwargs_seen) == 2  # first attempt + 1 retry
+    assert all(k["timeout"] == 0.2 for k in kwargs_seen)  # also passed to the client
+
+
+def test_openrouter_error_response_is_returned_not_raised():
+    resp = SimpleNamespace(choices=[], usage=None, error={"message": "upstream failed"})
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **k: resp)))
+    reply = harness.OpenRouterLLM(MODEL, client=client)([], [])
+    assert "upstream failed" in reply["error"]
+
+
+def test_progress_line_and_quiet(tmp_path, capsys):
+    llm = ScriptedLLM([tool_reply("turn", move="U")])
+    run(llm, tmp_path, depth=10, max_decisions=2)
+    out = capsys.readouterr().out.splitlines()
+    assert len(out) == 2
+    assert out[0].startswith(f"[{MODEL} s{SEED}] #1 turn(") and "stages " in out[0] and "$0.0010" in out[0]
+
+    run(llm, tmp_path, depth=10, max_decisions=2, progress=False)
+    assert capsys.readouterr().out == ""

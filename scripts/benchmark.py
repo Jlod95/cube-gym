@@ -28,7 +28,7 @@ from harness import RAW_DIR, ROOT, run_episode_raw, run_episode_tools  # noqa: E
 RESULTS_DIR = ROOT / "results"
 RUN_PREFIX = "bench-"
 FIELDS = ["model", "condition", "history", "seed", "attempt", "run_id", "solved", "max_stage",
-          "final_stage", "decisions", "quarter_turns", "invalid", "false_solved_claim",
+          "final_stage", "decisions", "quarter_turns", "invalid", "errors", "false_solved_claim",
           "total_cost_usd", "total_latency_ms", "stop_reason"]
 
 
@@ -98,19 +98,22 @@ def write_summaries(rows, results_dir):
     (results_dir / "summary.json").write_text(json.dumps(rows, indent=2) + "\n", encoding="utf-8")
 
 
-def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR):
+def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR,
+            episode_timeout=600, progress=True):
     model, condition, history, seed, attempt = key
     run_id = f"{RUN_PREFIX}{condition}-{model.replace('/', '_')}-{history}-s{seed}-k{attempt}"
     if condition == "A":
-        return run_episode_raw(model, seed, depth=depth, llm=llm, run_id=run_id, raw_dir=raw_dir)
+        return run_episode_raw(model, seed, depth=depth, llm=llm, run_id=run_id, raw_dir=raw_dir,
+                               episode_timeout=episode_timeout, progress=progress)
     return run_episode_tools(model, seed, depth=depth, max_decisions=max_decisions,
                              history=history, llm=llm, run_id=run_id, raw_dir=raw_dir,
-                             cost_limit=cost_limit)
+                             cost_limit=cost_limit, episode_timeout=episode_timeout,
+                             progress=progress)
 
 
 def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, max_decisions=60,
                   max_cost=None, dry_run=False, results_dir=RESULTS_DIR, raw_dir=RAW_DIR,
-                  llm_factory=None, out=print):
+                  llm_factory=None, out=print, episode_timeout=600, progress=True):
     """llm_factory(model) -> llm lets tests run without the network."""
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -164,7 +167,8 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
             cost_limit = max_cost - spent
 
         llm = llm_factory(model) if llm_factory else None
-        summary = run_one(key, depth, max_decisions, cost_limit, llm=llm, raw_dir=raw_dir)
+        summary = run_one(key, depth, max_decisions, cost_limit, llm=llm, raw_dir=raw_dir,
+                          episode_timeout=episode_timeout, progress=progress)
         spent += summary["total_cost_usd"]
         out(f"[{i}/{len(todo)}] {condition} {model} seed {seed} k{attempt}: "
             f"solved={summary['solved']} max_stage={summary['max_stage']} "
@@ -197,9 +201,12 @@ def main():
     p.add_argument("--max-decisions", type=int, default=60)
     p.add_argument("--max-cost", type=float, help="USD budget for all benchmark episodes")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--episode-timeout", type=float, default=600, help="seconds per episode")
+    p.add_argument("--quiet", action="store_true", help="no per-decision progress lines")
     a = p.parse_args()
     run_benchmark(a.models, a.conditions, parse_seeds(a.seeds), a.k, a.history, a.depth,
-                  a.max_decisions, a.max_cost, a.dry_run)
+                  a.max_decisions, a.max_cost, a.dry_run,
+                  episode_timeout=a.episode_timeout, progress=not a.quiet)
 
 
 if __name__ == "__main__":

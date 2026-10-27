@@ -1,10 +1,11 @@
 """Smoke test: one model, seeds 1 and 2, conditions A and B (window history).
 
-Usage: python scripts/smoke.py <openrouter-model-id>
+Usage: python scripts/smoke.py <openrouter-model-id> [--quiet]
 
 Stops early with a warning if the total cost goes over BUDGET_USD.
 """
 
+import argparse
 import sys
 from pathlib import Path
 
@@ -17,20 +18,22 @@ BUDGET_USD = 0.20
 
 
 def main():
-    if len(sys.argv) != 2:
-        sys.exit("usage: python scripts/smoke.py <openrouter-model-id>")
-    model = sys.argv[1]
+    p = argparse.ArgumentParser(description="Smoke test one model in conditions A and B.")
+    p.add_argument("model", help="OpenRouter model id")
+    p.add_argument("--quiet", action="store_true", help="no per-decision progress lines")
+    a = p.parse_args()
+    model, progress = a.model, not a.quiet
 
     runs = [("A", seed) for seed in SEEDS] + [("B", seed) for seed in SEEDS]
     results = []
     spent = 0.0
     for condition, seed in runs:
         if condition == "A":
-            summary = run_episode_raw(model, seed)
+            summary = run_episode_raw(model, seed, progress=progress)
         else:
             # Pass the remaining budget so a long B episode stops mid-way.
             summary = run_episode_tools(model, seed, history="window",
-                                        cost_limit=BUDGET_USD - spent)
+                                        cost_limit=BUDGET_USD - spent, progress=progress)
         spent += summary["total_cost_usd"]
         results.append((condition, seed, summary))
         print(f"done: {condition} seed {seed} ({summary['stop_reason']}), total ${spent:.4f}")
