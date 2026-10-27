@@ -48,6 +48,7 @@ def test_raw_has_no_algorithm_names(name):
 def test_method_states_harness_limits():
     import inspect
 
+    import harness
     from harness import MAX_TIMES, run_episode_tools
 
     defaults = inspect.signature(run_episode_tools).parameters
@@ -55,4 +56,9 @@ def test_method_states_harness_limits():
     assert f"at most {defaults['max_decisions'].default} actions" in METHOD
     assert f"{defaults['max_quarter_turns'].default} quarter turns" in METHOD
     assert "One tool call per turn" in METHOD
-    assert "Replying without a tool call ends the episode" in METHOD
+    assert "Every reply must contain a tool call" in METHOD
+    assert f"{harness.NO_TOOL_CALL_LIMIT_WORDS} such replies in a row end the episode" in METHOD
+
+
+def test_method_states_last_layer_up_to_u_turn():
+    assert "The last layer counts as done up to a final U turn" in METHOD

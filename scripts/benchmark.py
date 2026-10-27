@@ -37,7 +37,7 @@ RESULTS_DIR = ROOT / "results"
 RUN_PREFIX = "bench-"
 FIELDS = ["model", "condition", "history", "task", "seed", "attempt", "run_id", "start_stage",
           "target_stage", "target_reached", "solved", "max_stage",
-          "final_stage", "decisions", "quarter_turns", "invalid", "errors", "reasoning_tokens", "reasoning_max_tokens",
+          "final_stage", "decisions", "quarter_turns", "invalid", "errors", "no_tool_calls", "truncated", "revisits", "reasoning_tokens", "reasoning_max_tokens",
           "max_output_tokens", "false_solved_claim",
           "total_cost_usd", "total_latency_ms", "stop_reason"]
 

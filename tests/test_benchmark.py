@@ -90,3 +90,12 @@ def test_budgets_in_summary_and_part_of_resume_key(tmp_path):
     rows, text = run(tmp_path, conditions=["A"], seeds=[1])
     assert "0 already done; 1 to run" in text
     assert len(rows) == 2
+
+
+def test_summary_has_loop_and_reply_columns(tmp_path):
+    run(tmp_path, conditions=["B"], seeds=[1])
+    with open(tmp_path / "results" / "summary.csv", encoding="utf-8") as f:
+        row = next(csv.DictReader(f))
+    for col in ("revisits", "no_tool_calls", "truncated"):
+        assert col in row
+    assert row["no_tool_calls"] == "3"  # the fake never calls a tool

@@ -145,7 +145,17 @@ def _top_corner(front):
     return (x, 1, z)
 
 
+def _align_top(r):
+    """Turn U until the top edges match their centres (stages 5-6 count up
+    to a U turn, so they may be complete but not lined up)."""
+    for _ in range(4):
+        if all(_cubie_correct(r.state, U_EDGE_AT[f]) for f in FRONTS):
+            return
+        r.turn("U")
+
+
 def _corners_positioned(r):
+    _align_top(r)
     for _ in range(6):
         ok = [f for f in FRONTS if _corner_in_slot(r.state, _top_corner(f))]
         if len(ok) == 4:
@@ -157,6 +167,8 @@ def _twist_corners(r, front="green"):
     corner = _top_corner(front)
     u_sticker = next(i for i, f in _stickers(corner) if f == 0)
     for _ in range(4):
+        if all(r.state[i] == r.centre(0) for i in range(9)):  # all yellow up
+            break
         twists = 0
         while r.state[u_sticker] != r.centre(0) and twists < 6:
             r.alg("twist_corner", front)

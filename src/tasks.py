@@ -1,16 +1,17 @@
 """Stage tasks: cube states where exactly stages 1..stage-1 are complete.
 
 make_stage_task(stage, seed) starts from a solved cube and applies, in a
-seeded random order, inverses of the algorithms for that stage and later
-(random fronts and repeat counts), mixed with random U turns. It retries
-until stages_complete(state) == stage - 1. Each such state is reachable from
-solved by method algorithms, so the method can solve it.
+seeded random order, 4 to 8 inverses of the algorithms for that stage and
+later (random fronts and repeat counts), mixed with random U turns. It
+retries until stages_complete(state) == stage - 1, rejecting a cube that is
+solved apart from a U turn. Each such state is reachable from solved by
+method algorithms, so the method can solve it.
 """
 
 import random
 
 from algorithms import ALGORITHMS, FRONT_MAPS, parse, relabel
-from cube import SOLVED, apply
+from cube import SOLVED, apply, is_solved
 from stages import stages_complete
 
 # The stage each algorithm is used for (see prompts/method.md).
@@ -25,6 +26,7 @@ ALGORITHM_STAGE = {
 }
 STAGE_TASK_RANGE = range(2, 8)
 MAX_ATTEMPTS = 100_000
+MIN_ALGORITHMS, MAX_ALGORITHMS = 4, 8  # inverse algorithms mixed into each task
 
 
 def _inverse(moves):
@@ -40,16 +42,32 @@ def make_stage_task(stage, seed):
 
     for _ in range(MAX_ATTEMPTS):
         state = SOLVED
-        for _ in range(rng.randint(1, 6)):
-            if rng.random() < 0.3:
+        # twist_corner only leaves the lower layers intact when all its uses
+        # share one front (with only U turns between), so each attempt picks
+        # one front for it; other algorithms get a random front each time.
+        twist_front = rng.choice(fronts)
+        for _ in range(rng.randint(MIN_ALGORITHMS, MAX_ALGORITHMS)):
+            for _ in range(rng.randint(0, 2)):
                 state = apply(state, rng.choice(["U", "U'"]))
-                continue
-            moves = _inverse(relabel(parse(ALGORITHMS[rng.choice(names)]), rng.choice(fronts)))
+            name = rng.choice(names)
+            front = twist_front if name == "twist_corner" else rng.choice(fronts)
+            moves = _inverse(relabel(parse(ALGORITHMS[name]), front))
             for move in moves * rng.randint(1, 5):
                 state = apply(state, move)
-        if stages_complete(state) == stage - 1:
+        for _ in range(rng.randint(0, 3)):
+            state = apply(state, "U")
+        if stages_complete(state) == stage - 1 and not _one_u_turn_from_solved(state):
             return state
     raise RuntimeError(f"no stage {stage} task found for seed {seed}")
+
+
+def _one_u_turn_from_solved(state):
+    """True for the trivial stage 7 case: solved apart from a final U turn."""
+    for _ in range(4):
+        if is_solved(state):
+            return True
+        state = apply(state, "U")
+    return False
 
 
 def parse_tasks(text):

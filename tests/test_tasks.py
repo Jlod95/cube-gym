@@ -111,3 +111,13 @@ def test_benchmark_stage_tasks_condition_b_only(tmp_path):
                     ("stage3", "B", 1), ("stage3", "B", 2)]
     stage_rows = [r for r in rows if r["task"] != "full"]
     assert all(r["start_stage"] == r["target_stage"] - 1 for r in stage_rows)
+
+
+def test_stage7_task_is_never_just_a_u_turn():
+    from cube import apply, is_solved
+
+    for seed in SEEDS:
+        state = task(7, seed)
+        for _ in range(4):
+            assert not is_solved(state)
+            state = apply(state, "U")

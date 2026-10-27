@@ -1,6 +1,6 @@
 """Progress through the beginner layer-by-layer method (white on D)."""
 
-from cube import _INDEX, FACES, NORMALS, is_solved
+from cube import _INDEX, FACES, NORMALS, apply, is_solved
 
 
 def _stickers(pos):
@@ -39,13 +39,33 @@ def _corner_in_slot(state, pos):
     return {state[i] for i, _ in stickers} == {_centre(state, f) for _, f in stickers}
 
 
+def _u_turns(state):
+    """The state after 0, 1, 2 and 3 quarter turns of U."""
+    out = [state]
+    for _ in range(3):
+        out.append(apply(out[-1], "U"))
+    return out
+
+
+def _top_edges_ok(state):
+    return all(_cubie_correct(state, p) for p in U_EDGES)
+
+
+def _top_corners_ok(state):
+    return all(_corner_in_slot(state, p) for p in U_CORNERS)
+
+
+# Stages 5 and 6 count as complete up to a final U turn (AUF): they pass if
+# some U turn (0-3 quarter turns) would make them hold. Stage 6 needs one turn
+# that satisfies both its edges and corners. Stage 7 means exactly solved.
 STAGES = [
     ("cross", lambda s: all(_cubie_correct(s, p) for p in D_EDGES)),
     ("first layer", lambda s: all(_cubie_correct(s, p) for p in D_CORNERS)),
     ("second layer", lambda s: all(_cubie_correct(s, p) for p in MID_EDGES)),
     ("yellow cross", lambda s: all(_yellow_up(s, p) for p in U_EDGES)),
-    ("yellow edges", lambda s: all(_cubie_correct(s, p) for p in U_EDGES)),
-    ("corners positioned", lambda s: all(_corner_in_slot(s, p) for p in U_CORNERS)),
+    ("yellow edges", lambda s: any(_top_edges_ok(t) for t in _u_turns(s))),
+    ("corners positioned",
+     lambda s: any(_top_edges_ok(t) and _top_corners_ok(t) for t in _u_turns(s))),
     ("solved", is_solved),
 ]
 
@@ -54,7 +74,8 @@ def stages_complete(state):
     """Number of stages complete in a row from stage 1 (0 to 7).
 
     Each check above only adds its new condition; counting stops at the
-    first failure, so stage n implies stages 1..n-1.
+    first failure, so stage n implies stages 1..n-1. Stages 5 and 6 are
+    judged up to a U turn; stage 7 requires the exact solved state.
     """
     count = 0
     for _, check in STAGES:

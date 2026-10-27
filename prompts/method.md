@@ -63,11 +63,16 @@ expected to come apart temporarily (see twist_corner).
 4. **Yellow cross**: the second layer, plus all four top edges with yellow facing
    up. Their side stickers don't need to match yet.
 5. **Yellow edges**: the yellow cross, plus each top edge's side sticker matching
-   its side centre.
+   its side centre, up to a U turn.
 6. **Corners positioned**: the yellow edges, plus each top corner in its correct
-   slot. Its three colours match the three centres around it, but it may be
-   twisted.
-7. **Solved**: every sticker matches its face's centre.
+   slot, up to a U turn. Its three colours match the three centres around it,
+   but it may be twisted.
+7. **Solved**: every sticker matches its face's centre exactly.
+
+**The last layer counts as done up to a final U turn.** Stages 5 and 6 count
+as complete if some turn of the U face (0, 1, 2 or 3 quarter turns) would make
+them hold, so turning U alone never loses them. Stage 7 needs the cube exactly
+solved, so finish with the U turn that lines the top layer up.
 
 ## Tools
 
@@ -110,10 +115,13 @@ from 1 to 6 (default 1); any other value is rejected as an invalid action.
 
 - **One tool call per turn.** Only your first tool call is carried out; any
   others in the same reply are rejected and not run.
-- **Replying without a tool call ends the episode.** Don't stop to explain or
-  ask questions; keep calling tools until the cube is solved. Only reply with
-  plain text if you are giving up, and don't claim the cube is solved unless it
-  is.
+- **Every reply must contain a tool call.** A reply without one (including one
+  cut off before it got to a tool call) still uses up an action, and you are
+  asked again. Three such replies in a row end the episode. Don't stop to
+  explain or ask questions; keep calling tools until the cube is solved, and
+  don't claim the cube is solved unless it is.
+- **Keep your thinking short.** Each reply has a fixed output budget; a reply
+  that spends it all on thinking is cut off without a tool call.
 - **Limits.** You have at most 60 actions (tool calls) and 300 quarter turns in
   total. An algorithm counts one quarter turn per move, times `times`. The
   episode ends when either limit is reached.

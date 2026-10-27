@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import openai
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
@@ -416,3 +417,107 @@ def test_output_cap_must_exceed_reasoning_budget():
 
     with pytest.raises(ValueError, match="must be larger"):
         harness.run_episode_raw(MODEL, SEED, reasoning_max_tokens=4000, max_output_tokens=4000)
+
+
+# --- pilot fixes: no-tool-call replies, MOVES parsing, revisits ---------------
+
+
+def truncated_reply():
+    return {"content": None, "tool_calls": [], "finish_reason": "length", "usage": USAGE}
+
+
+def test_truncated_replies_do_not_end_episode(tmp_path):
+    fix = inverse(scramble(1, SEED)[0])
+    llm = ScriptedLLM([truncated_reply(), text_reply("Let me think about this."),
+                       tool_reply("turn", move=fix)])
+    summary = run(llm, tmp_path)
+
+    assert summary["solved"] is True
+    assert summary["decisions"] == 3
+    assert summary["no_tool_calls"] == 2 and summary["truncated"] == 1
+    log = read_log(summary)
+    assert [r.get("reply_kind") for r in log] == ["truncated", "no_tool_call", None]
+    # The model is told why, in the next request.
+    assert llm.calls[1][-1]["content"].endswith(harness.NO_TOOL_CALL_NUDGE)
+    assert llm.calls[2][-1]["content"].endswith(harness.NO_TOOL_CALL_NUDGE)
+
+
+def test_three_no_tool_call_replies_in_a_row_end_episode(tmp_path):
+    llm = ScriptedLLM([truncated_reply()])
+    summary = run(llm, tmp_path, depth=10)
+    assert summary["stop_reason"] == "no_tool_call"
+    assert summary["decisions"] == 3 and summary["truncated"] == 3
+
+
+def test_no_tool_call_streak_resets_after_a_tool_call(tmp_path):
+    llm = ScriptedLLM([text_reply("hmm"), text_reply("hmm"), tool_reply("turn", move="U"),
+                       text_reply("hmm"), text_reply("hmm"), tool_reply("turn", move="U'"),
+                       text_reply("done")])
+    summary = run(llm, tmp_path, depth=10, max_decisions=7)
+    assert summary["stop_reason"] == "max_decisions"
+    assert summary["no_tool_calls"] == 5
+
+
+def test_nudge_in_full_history(tmp_path):
+    llm = ScriptedLLM([text_reply("thinking"), tool_reply("turn", move="U"), text_reply("x")])
+    run(llm, tmp_path, depth=10, history="full", max_decisions=2)
+    roles = [m["role"] for m in llm.calls[1]]
+    assert roles == ["system", "user", "assistant", "user"]
+    assert llm.calls[1][-1]["content"] == harness.NO_TOOL_CALL_NUDGE
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("MOVES: R U R' U'", ["R", "U", "R'", "U'"]),
+    ("**MOVES:** R U2", ["R", "U", "U"]),
+    ("Here you go.\n\n**Moves:** `R U'`", ["R", "U'"]),
+    ("moves: F B'", ["F", "B'"]),
+    ("```\nMOVES: R U\n```", ["R", "U"]),
+    ("**MOVES:**\n```\nR U F'\n```", ["R", "U", "F'"]),
+    ("- MOVES: R, U, F2.", ["R", "U", "F", "F"]),
+    ("MOVES: R’ U", ["R'", "U"]),
+    ("## MOVES: D", ["D"]),
+    ("MOVES: R\nlater...\nMOVES: U", ["U"]),  # the last MOVES line wins
+])
+def test_parse_moves_formatting(text, expected):
+    moves, bad = harness.parse_moves_reply(text)
+    assert moves == expected and bad == []
+
+
+@pytest.mark.parametrize("text", [
+    "R U R' U'",
+    "The moves are R U",
+    "I wasn't able to work out a verified solution for this scramble.",
+    "",
+    None,
+])
+def test_parse_moves_still_requires_moves_line(text):
+    assert harness.parse_moves_reply(text) == (None, [])
+
+
+def test_raw_truncated_reply(tmp_path):
+    reply = {"content": "Let me trace the U face", "tool_calls": [], "finish_reason": "length",
+             "usage": USAGE}
+    summary = harness.run_episode_raw(MODEL, SEED, llm=ScriptedLLM([reply]), raw_dir=tmp_path)
+    assert summary["stop_reason"] == "truncated"
+    rec = read_log(summary)[0]
+    assert rec["parse_error"] == "truncated" and rec["reply_text"] == "Let me trace the U face"
+
+
+def test_raw_parse_failure_logs_reply_text(tmp_path):
+    text = "I can't verify a solution; try a Kociemba solver."
+    summary = harness.run_episode_raw(MODEL, SEED, llm=ScriptedLLM([text_reply(text)]),
+                                      raw_dir=tmp_path)
+    assert summary["stop_reason"] == "no_moves_line"
+    assert read_log(summary)[0]["reply_text"] == text
+
+
+def test_revisits_counted(tmp_path):
+    llm = ScriptedLLM([tool_reply("turn", move="U"), tool_reply("turn", move="U'"),
+                       tool_reply("turn", move="nope"), tool_reply("turn", move="U"),
+                       tool_reply("turn", move="U'")])
+    summary = run(llm, tmp_path, depth=10, max_decisions=5)
+    # U (new), U' (back to start), invalid (no move, not counted), U, U'
+    assert summary["revisits"] == 3
+    log = read_log(summary)
+    assert [r["revisit"] for r in log] == [False, True, False, True, True]
+    assert log[-1]["revisits"] == 3

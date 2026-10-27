@@ -29,6 +29,9 @@ MODELS_URL = OPENROUTER_BASE_URL + "/models"
 MAX_TIMES = 6
 DEFAULT_REASONING_MAX_TOKENS = 2000
 DEFAULT_MAX_OUTPUT_TOKENS = 4000
+NO_TOOL_CALL_LIMIT = 3  # replies in a row without a tool call that end an episode
+NO_TOOL_CALL_LIMIT_WORDS = "Three"  # as written in prompts/method.md
+NO_TOOL_CALL_NUDGE = "Your last reply had no tool call. Reply with exactly one tool call."
 
 TOOLS = [
     {
@@ -374,6 +377,9 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
         env.restore(start_state)
     start_stage = max_stage = stages_complete(env.state)
     decisions = quarter_turns = invalid = errors = reasoning_total = 0
+    no_tool_calls = truncated = no_tool_streak = revisits = 0
+    seen_states = {env.state}
+    nudge = False  # last reply had no tool call: remind the model
     total_cost = 0.0
     total_latency = 0
     false_claim = False
@@ -408,6 +414,8 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                 if recent:
                     lines = [f"{i}. {a} -> {r}" for i, (a, r) in enumerate(recent[-window:], 1)]
                     text += f"\n\nLast {len(lines)} action(s):\n" + "\n".join(lines)
+                if nudge:
+                    text += f"\n\n{NO_TOOL_CALL_NUDGE}"
                 messages = [{"role": "system", "content": system},
                             {"role": "user", "content": text}]
 
@@ -455,15 +463,29 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                 continue
 
             if not calls:
-                false_claim = claims_solved(reply.get("content")) and not is_solved(env.state)
-                record["final_reply"] = reply.get("content")
-                record["false_solved_claim"] = false_claim
+                # Counts as a decision; the model is asked again. Only
+                # NO_TOOL_CALL_LIMIT such replies in a row end the episode.
+                kind = "truncated" if reply.get("finish_reason") == "length" else "no_tool_call"
+                no_tool_calls += 1
+                truncated += kind == "truncated"
+                no_tool_streak += 1
+                claim = claims_solved(reply.get("content")) and not is_solved(env.state)
+                false_claim = false_claim or claim
+                record.update(reply_kind=kind, reply_text=reply.get("content"),
+                              false_solved_claim=claim, no_tool_call_streak=no_tool_streak)
                 write_line(log, record)
                 if progress:
-                    progress_line(model, seed, decisions, "(text reply, no tool call)",
+                    progress_line(model, seed, decisions, f"({kind}, no tool call)",
                                   record["stages_complete"], total_cost)
-                stop_reason = "no_tool_call"
-                break
+                if no_tool_streak >= NO_TOOL_CALL_LIMIT:
+                    stop_reason = "no_tool_call"
+                    break
+                nudge = True
+                conversation.append({"role": "assistant", "content": reply.get("content") or ""})
+                conversation.append({"role": "user", "content": NO_TOOL_CALL_NUDGE})
+                continue
+            no_tool_streak = 0
+            nudge = False
 
             # One action per decision: run the first call, refuse any extras.
             call = calls[0]
@@ -472,8 +494,13 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
             invalid += not valid
             stages = stages_complete(env.state)
             max_stage = max(max_stage, stages)
+            # Loop metric: a valid action that lands on a state already seen
+            # in this episode. (Invalid actions don't move the cube.)
+            revisit = valid and env.state in seen_states
+            revisits += revisit
+            seen_states.add(env.state)
             record.update(tool=call["name"], arguments=call["arguments"], valid=valid,
-                          stages_complete=stages)
+                          stages_complete=stages, revisit=revisit, revisits=revisits)
             if len(calls) > 1:
                 record["ignored_tool_calls"] = len(calls) - 1
             write_line(log, record)
@@ -509,6 +536,9 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
         "quarter_turns": quarter_turns,
         "invalid": invalid,
         "errors": errors,
+        "no_tool_calls": no_tool_calls,
+        "truncated": truncated,
+        "revisits": revisits,
         "reasoning_tokens": reasoning_total,
         "reasoning_max_tokens": reasoning_max_tokens,
         "max_output_tokens": max_output_tokens,
@@ -521,19 +551,41 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
 
 # --- condition A: one reply with the whole solution ------------------------
 
-_MOVES_LINE = re.compile(r"^\s*MOVES:(.*)$", re.M)
+# "moves:" at the start of a line, once markdown decoration is removed.
+_MOVES_LINE = re.compile(r"^(?:[-#>]\s*)*moves\s*:(.*)$", re.I)
+_DECORATION = str.maketrans("", "", "*_`")
+_PRIMES = str.maketrans({"’": "'", "‘": "'", "′": "'"})
 
 
 def parse_moves_reply(text):
-    """Quarter turns from the 'MOVES:' line (X2 -> X X), plus invalid tokens.
+    """Quarter turns from the MOVES line (X2 -> X X), plus invalid tokens.
 
-    Returns (moves, invalid_tokens), or (None, []) if there is no MOVES: line.
+    A MOVES line is still required, but common formatting around it is
+    accepted: bold or italics (**MOVES:**), backticks, code fences, list or
+    heading markers, any capitalisation of "moves", curly primes. If the
+    line has nothing after the colon, the next non-empty line (e.g. inside a
+    code fence) is used. The last MOVES line in the reply wins.
+
+    Returns (moves, invalid_tokens), or (None, []) if there is no MOVES line.
     """
-    match = _MOVES_LINE.search(text or "")
-    if not match:
+    lines = [line.translate(_DECORATION).translate(_PRIMES).strip()
+             for line in (text or "").splitlines()]
+    lines = [line for line in lines if line]  # fences become empty once ` is removed
+    found = None
+    for i, line in enumerate(lines):
+        match = _MOVES_LINE.match(line)
+        if match:
+            rest = match.group(1).strip()
+            if not rest and i + 1 < len(lines) and not _MOVES_LINE.match(lines[i + 1]):
+                rest = lines[i + 1]
+            found = rest
+    if found is None:
         return None, []
     moves, bad = [], []
-    for token in match.group(1).split():
+    for token in found.replace(",", " ").split():
+        token = token.rstrip(".;")
+        if not token:
+            continue
         if token in MOVE_NAMES:
             moves.append(token)
         elif len(token) == 2 and token[1] == "2" and token[0] in "UDLRFB":
@@ -587,7 +639,8 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         moves, bad = parse_moves_reply(reply.get("content"))
         stop_reason = "answered"
         if moves is None:
-            moves, stop_reason = [], "no_moves_line"
+            truncated = reply.get("finish_reason") == "length"
+            moves, stop_reason = [], "truncated" if truncated else "no_moves_line"
         if len(moves) > max_quarter_turns:
             moves, stop_reason = moves[:max_quarter_turns], "max_quarter_turns"
     for move in moves:
@@ -598,13 +651,16 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "run_id": run_id, "model": model, "condition": "A", "seed": seed,
         "task": "full", "start_stage": start_stage, "decision": 1,
         "tool": None, "arguments": reply.get("content") if reply else None,
-        "valid": reply is not None and stop_reason != "no_moves_line" and not bad,
+        "valid": stop_reason in ("answered", "max_quarter_turns") and not bad,
         "invalid_tokens": bad, "stages_complete": stages_complete(env.state),
         "input_tokens": in_tok, "output_tokens": out_tok, **extra_fields, "cost_usd": cost,
         "cost_source": cost_source, "latency_ms": latency_ms,
     }
     if error:
         record["error"] = error
+    if stop_reason in ("no_moves_line", "truncated"):
+        record["parse_error"] = stop_reason
+        record["reply_text"] = reply.get("content")
     with open(log_path, "w", encoding="utf-8") as log:
         write_line(log, record)
     if progress:
@@ -623,7 +679,7 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "final_stage": stages_complete(env.state),
         "decisions": 1,
         "quarter_turns": len(moves),
-        "invalid": len(bad) + (stop_reason == "no_moves_line"),
+        "invalid": len(bad) + (stop_reason in ("no_moves_line", "truncated")),
         "errors": int(error is not None),
         "reasoning_tokens": extra_fields["reasoning_tokens"] or 0,
         "reasoning_max_tokens": reasoning_max_tokens,
