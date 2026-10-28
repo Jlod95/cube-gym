@@ -56,3 +56,6 @@ MOVES: R U R' U' F2 D
 
 The moves will be applied in order to the cube as shown. Only the `MOVES:` line
 is read.
+
+Always give your best attempt as a MOVES line, even if you are unsure it solves
+the cube. Never decline.

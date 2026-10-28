@@ -24,6 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from harness import (  # noqa: E402
+    DEFAULT_EPISODE_TIMEOUT,
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_REASONING_EFFORT,
     DEFAULT_REASONING_MAX_TOKENS,
@@ -146,7 +147,7 @@ def write_summaries(rows, results_dir):
 
 
 def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR,
-            episode_timeout=600, progress=True):
+            episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True):
     (model, condition, history, task, seed, attempt,
      reasoning_effort, reasoning_max_tokens, max_output_tokens) = key
     run_id = (f"{RUN_PREFIX}{condition}-{model.replace('/', '_')}-{task}-{history}-s{seed}"
@@ -170,7 +171,7 @@ def task_args(task, seed):
 
 def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, max_decisions=60,
                   max_cost=None, dry_run=False, results_dir=RESULTS_DIR, raw_dir=RAW_DIR,
-                  llm_factory=None, out=print, episode_timeout=600, progress=True,
+                  llm_factory=None, out=print, episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True,
                   reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                   max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, tasks=("full",),
                   stage_seeds=(), reasoning_effort=DEFAULT_REASONING_EFFORT, thinking_arms=None):
@@ -327,7 +328,8 @@ def main():
     p.add_argument("--max-decisions", type=int, default=60)
     p.add_argument("--max-cost", type=float, help="USD budget for all benchmark episodes")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--episode-timeout", type=float, default=600, help="seconds per episode")
+    p.add_argument("--episode-timeout", type=float, default=DEFAULT_EPISODE_TIMEOUT,
+                   help=f"wall-clock seconds per episode (default {DEFAULT_EPISODE_TIMEOUT})")
     p.add_argument("--quiet", action="store_true", help="no per-decision progress lines")
     add_thinking_args(p, arms=True)
     a = p.parse_args()

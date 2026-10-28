@@ -70,3 +70,8 @@ def test_method_explains_yellow_up_cue():
     stage7 = METHOD[METHOD.index("### Stage 7"):METHOD.index("## General advice")]
     assert f"`{YELLOW_UP_LABEL}: n/9`" in stage7
     assert "top front-right corner" in stage7 and "not the lower layers" in stage7
+
+
+def test_raw_asks_for_an_answer_every_time():
+    assert ("Always give your best attempt as a MOVES line, even if you are unsure it solves\n"
+            "the cube. Never decline.") in RAW

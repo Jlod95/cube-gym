@@ -35,6 +35,9 @@ DEFAULT_REASONING_MAX_TOKENS = None
 DEFAULT_MAX_OUTPUT_TOKENS = 8000
 REASONING_EFFORTS = ("low", "none")  # offered on the command line, plus "unset"
 YELLOW_UP_LABEL = "yellow stickers facing up"
+# Wall-clock limit per episode (s). Long enough that max_decisions (60) is
+# what normally ends an episode; this is a safety net.
+DEFAULT_EPISODE_TIMEOUT = 1800
 NO_TOOL_CALL_LIMIT = 3  # replies in a row without a tool call that end an episode
 NO_TOOL_CALL_LIMIT_WORDS = "Three"  # as written in prompts/method.md
 NO_TOOL_CALL_NUDGE = "Your last reply had no tool call. Reply with exactly one tool call."
@@ -372,7 +375,7 @@ def progress_line(model, seed, decision, action, stages, cost):
 
 def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns=300,
                       history="window", window=5, llm=None, run_id=None, raw_dir=RAW_DIR,
-                      cost_limit=None, episode_timeout=600, progress=True,
+                      cost_limit=None, episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True,
                       reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                       max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
                       reasoning_effort=DEFAULT_REASONING_EFFORT, start_state=None, task="full", target_stage=7):
@@ -632,7 +635,7 @@ def parse_moves_reply(text):
 
 
 def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
-                    run_id=None, raw_dir=RAW_DIR, episode_timeout=600, progress=True,
+                    run_id=None, raw_dir=RAW_DIR, episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True,
                     reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                     max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
                     reasoning_effort=DEFAULT_REASONING_EFFORT):
@@ -680,7 +683,8 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         stop_reason = "answered"
         if moves is None:
             truncated = reply.get("finish_reason") == "length"
-            moves, stop_reason = [], "truncated" if truncated else "no_moves_line"
+            # No MOVES line: cut off, or the model declined to answer.
+            moves, stop_reason = [], "truncated" if truncated else "declined"
         if len(moves) > max_quarter_turns:
             moves, stop_reason = moves[:max_quarter_turns], "max_quarter_turns"
     for move in moves:
@@ -698,7 +702,7 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
     }
     if error:
         record["error"] = error
-    if stop_reason in ("no_moves_line", "truncated"):
+    if stop_reason in ("declined", "truncated"):
         record["parse_error"] = stop_reason
         record["reply_text"] = reply.get("content")
     with open(log_path, "w", encoding="utf-8") as log:
@@ -719,7 +723,7 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "final_stage": stages_complete(env.state),
         "decisions": 1,
         "quarter_turns": len(moves),
-        "invalid": len(bad) + (stop_reason in ("no_moves_line", "truncated")),
+        "invalid": len(bad) + (stop_reason in ("declined", "truncated")),
         "errors": int(error is not None),
         "reasoning_tokens": extra_fields["reasoning_tokens"] or 0,
         "reasoning_effort": reasoning_effort,

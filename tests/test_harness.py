@@ -183,7 +183,7 @@ def test_raw_condition_solves_with_moves_line(tmp_path):
 def test_raw_condition_without_moves_line(tmp_path):
     llm = ScriptedLLM([text_reply("R U R' U'")])
     summary = harness.run_episode_raw(MODEL, SEED, depth=5, llm=llm, raw_dir=tmp_path)
-    assert summary["stop_reason"] == "no_moves_line"
+    assert summary["stop_reason"] == "declined"
     assert summary["quarter_turns"] == 0 and summary["invalid"] == 1
 
 
@@ -531,7 +531,7 @@ def test_raw_parse_failure_logs_reply_text(tmp_path):
     text = "I can't verify a solution; try a Kociemba solver."
     summary = harness.run_episode_raw(MODEL, SEED, llm=ScriptedLLM([text_reply(text)]),
                                       raw_dir=tmp_path)
-    assert summary["stop_reason"] == "no_moves_line"
+    assert summary["stop_reason"] == "declined"
     assert read_log(summary)[0]["reply_text"] == text
 
 
@@ -567,3 +567,25 @@ def test_yellow_up_feedback_after_every_action(tmp_path):
     tool_msg = llm.calls[1][-1]
     assert tool_msg["role"] == "tool"
     assert tool_msg["content"].startswith("OK: turned R.\nyellow stickers facing up: 6/9\n\n")
+
+
+def test_episode_timeout_default_is_30_minutes():
+    import inspect
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+    import benchmark
+    import smoke
+
+    assert harness.DEFAULT_EPISODE_TIMEOUT == 1800
+    for fn in (harness.run_episode_tools, harness.run_episode_raw, benchmark.run_one,
+               benchmark.run_benchmark, smoke.run_smoke):
+        assert inspect.signature(fn).parameters["episode_timeout"].default == 1800, fn.__name__
+
+
+def test_raw_declined_reply(tmp_path):
+    text = "I can't verify a solution for this scramble."
+    summary = harness.run_episode_raw(MODEL, SEED, llm=ScriptedLLM([text_reply(text)]),
+                                      raw_dir=tmp_path)
+    assert summary["stop_reason"] == "declined" and summary["invalid"] == 1
+    rec = read_log(summary)[0]
+    assert rec["parse_error"] == "declined" and rec["reply_text"] == text
