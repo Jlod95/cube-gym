@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from benchmark import (  # noqa: E402
+    add_request_timeout_arg,
     add_thinking_args,
     describe_arm,
     parse_seeds,
@@ -35,6 +36,7 @@ from harness import (  # noqa: E402
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_REASONING_EFFORT,
     DEFAULT_REASONING_MAX_TOKENS,
+    DEFAULT_REQUEST_TIMEOUT,
     RAW_DIR,
     run_episode_raw,
     run_episode_tools,
@@ -46,7 +48,7 @@ def run_smoke(model, seeds=(1, 2), tasks=("full",), stage_seeds=(1,), max_cost=0
               reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
               max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, progress=True, llm=None,
               raw_dir=RAW_DIR, out=print, reasoning_effort=DEFAULT_REASONING_EFFORT,
-              episode_timeout=DEFAULT_EPISODE_TIMEOUT):
+              episode_timeout=DEFAULT_EPISODE_TIMEOUT, request_timeout=DEFAULT_REQUEST_TIMEOUT):
     """Run the smoke episodes; return [(key, summary)]. `llm` is for tests."""
     budgets = thinking_arm(reasoning_effort, reasoning_max_tokens, max_output_tokens)
     plan = plan_episodes([model], ["A", "B"], seeds, 1, "window", [budgets], tasks, stage_seeds)
@@ -59,12 +61,14 @@ def run_smoke(model, seeds=(1, 2), tasks=("full",), stage_seeds=(1,), max_cost=0
         _, condition, history, task, seed, *_ = key
         if condition == "A":
             summary = run_episode_raw(model, seed, llm=llm, raw_dir=raw_dir, progress=progress,
-                                      episode_timeout=episode_timeout, **budgets)
+                                      episode_timeout=episode_timeout,
+                                      request_timeout=request_timeout, **budgets)
         else:
             # Pass the remaining budget so a long B episode stops mid-way.
             summary = run_episode_tools(model, seed, history=history, llm=llm, raw_dir=raw_dir,
                                         cost_limit=max_cost - spent, progress=progress,
                                         episode_timeout=episode_timeout,
+                                        request_timeout=request_timeout,
                                         **budgets, **task_args(task, seed))
         spent += summary["total_cost_usd"]
         results.append((key, summary))
@@ -109,11 +113,13 @@ def main():
     p.add_argument("--quiet", action="store_true", help="no per-decision progress lines")
     p.add_argument("--episode-timeout", type=float, default=DEFAULT_EPISODE_TIMEOUT,
                    help=f"wall-clock seconds per episode (default {DEFAULT_EPISODE_TIMEOUT})")
+    add_request_timeout_arg(p)
     add_thinking_args(p)
     a = p.parse_args()
     run_smoke(a.model, parse_seeds(a.seeds), parse_tasks(a.tasks), parse_seeds(a.stage_seeds),
               a.max_cost, a.reasoning_max_tokens, a.max_output_tokens, progress=not a.quiet,
-              reasoning_effort=resolve_effort(p, a), episode_timeout=a.episode_timeout)
+              reasoning_effort=resolve_effort(p, a), episode_timeout=a.episode_timeout,
+              request_timeout=a.request_timeout)
 
 
 if __name__ == "__main__":

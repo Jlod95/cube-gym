@@ -38,6 +38,10 @@ YELLOW_UP_LABEL = "yellow stickers facing up"
 # Wall-clock limit per episode (s). Long enough that max_decisions (60) is
 # what normally ends an episode; this is a safety net.
 DEFAULT_EPISODE_TIMEOUT = 1800
+# Wall-clock deadline per API request attempt (s), and retries after a failed
+# attempt. Slow providers can take minutes to answer, so this is generous.
+DEFAULT_REQUEST_TIMEOUT = 180
+REQUEST_RETRIES = 3
 NO_TOOL_CALL_LIMIT = 3  # replies in a row without a tool call that end an episode
 NO_TOOL_CALL_LIMIT_WORDS = "Three"  # as written in prompts/method.md
 NO_TOOL_CALL_NUDGE = "Your last reply had no tool call. Reply with exactly one tool call."
@@ -78,10 +82,15 @@ TOOLS = [
 
 
 class DeadlineExceeded(Exception):
-    pass
+    """The episode's wall-clock limit ran out (stop_reason "timeout")."""
 
 
-def call_with_deadline(fn, seconds):
+class RequestTimeout(Exception):
+    """One API request attempt, or all of its retries, ran past the
+    per-request deadline (stop_reason "request_timeout")."""
+
+
+def call_with_deadline(fn, seconds, error=DeadlineExceeded):
     """Run fn() but give up after `seconds` of wall-clock time.
 
     The openai client's `timeout` is passed to its HTTP library (httpx2), where it limits each
@@ -102,15 +111,18 @@ def call_with_deadline(fn, seconds):
     worker.start()
     worker.join(max(seconds, 0))
     if worker.is_alive():
-        raise DeadlineExceeded(f"no response within {seconds:.0f} s")
+        raise error(f"no response within {seconds:.0f} s")
     if "error" in result:
         raise result["error"]
     return result["value"]
 
 
 class OpenRouterLLM:
-    """Calls OpenRouter with a hard 60 s wall-clock timeout per attempt and up
-    to 3 retries with backoff.
+    """Calls OpenRouter with a hard wall-clock deadline per attempt (`timeout`,
+    default DEFAULT_REQUEST_TIMEOUT) and up to REQUEST_RETRIES retries with
+    backoff. When every attempt fails, the last error is raised; if they all
+    timed out, that is RequestTimeout. Replies report `attempts` and
+    `timed_out_attempts`.
 
     The API key is read from .env / the environment and only ever passed to
     the client; it is never stored in logs or returned.
@@ -129,7 +141,8 @@ class OpenRouterLLM:
     resent without it and the reply's reasoning_status says "rejected: ...".
     """
 
-    def __init__(self, model, client=None, timeout=60, retries=3, backoff=2.0,
+    def __init__(self, model, client=None, timeout=DEFAULT_REQUEST_TIMEOUT,
+                 retries=REQUEST_RETRIES, backoff=2.0,
                  reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                  max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
                  reasoning_effort=DEFAULT_REASONING_EFFORT):
@@ -157,7 +170,7 @@ class OpenRouterLLM:
         import openai
 
         retryable = (openai.APIConnectionError, openai.APITimeoutError,
-                     openai.RateLimitError, openai.InternalServerError, DeadlineExceeded)
+                     openai.RateLimitError, openai.InternalServerError, RequestTimeout)
         extra = {"tools": tools, "parallel_tool_calls": False} if tools else {}
         if self.max_output_tokens is not None:
             extra["max_tokens"] = self.max_output_tokens
@@ -175,10 +188,10 @@ class OpenRouterLLM:
                 extra_body=dict(body) or None, **extra,
             )
 
-        attempt = 0
+        attempt = timed_out = 0
         while True:
             try:
-                resp = call_with_deadline(request, self.timeout)
+                resp = call_with_deadline(request, self.timeout, RequestTimeout)
                 break
             except openai.BadRequestError as exc:
                 if "reasoning" not in body:
@@ -186,8 +199,12 @@ class OpenRouterLLM:
                 # Provider refused the reasoning setting: log it, resend without.
                 rejected = f"rejected: {str(exc)[:200]}"
                 body.pop("reasoning")
-            except retryable:
+            except retryable as exc:
+                timed_out += isinstance(exc, RequestTimeout)
                 if attempt == self.retries:
+                    if timed_out == attempt + 1:
+                        raise RequestTimeout(f"all {timed_out} attempts timed out after "
+                                             f"{self.timeout:.0f} s each") from exc
                     raise
                 time.sleep(self.backoff * 2 ** attempt)
                 attempt += 1
@@ -209,7 +226,8 @@ class OpenRouterLLM:
         error = getattr(resp, "error", None)
         if error or not choices or getattr(choices[0], "message", None) is None:
             return {"error": str(error or "response had no message"), "content": None,
-                    "tool_calls": [], "usage": usage_dict, "reasoning_status": status}
+                    "tool_calls": [], "usage": usage_dict, "reasoning_status": status,
+                    "attempts": attempt + 1, "timed_out_attempts": timed_out}
 
         msg = choices[0].message
         return {
@@ -221,6 +239,8 @@ class OpenRouterLLM:
             "usage": usage_dict,
             "finish_reason": getattr(choices[0], "finish_reason", None),
             "reasoning_status": status,
+            "attempts": attempt + 1,
+            "timed_out_attempts": timed_out,
         }
 
 
@@ -265,6 +285,8 @@ def reasoning_fields(reply, reasoning_max_tokens, max_output_tokens, reasoning_e
         "visible_output_tokens": output - (reasoning or 0),
         "reasoning_status": reply.get("reasoning_status"),
         "finish_reason": reply.get("finish_reason"),
+        "attempts": reply.get("attempts"),
+        "timed_out_attempts": reply.get("timed_out_attempts"),
         "reasoning_effort": reasoning_effort,
         "reasoning_max_tokens": reasoning_max_tokens,
         "max_output_tokens": max_output_tokens,
@@ -378,7 +400,8 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                       cost_limit=None, episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True,
                       reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                       max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-                      reasoning_effort=DEFAULT_REASONING_EFFORT, start_state=None, task="full", target_stage=7):
+                      reasoning_effort=DEFAULT_REASONING_EFFORT,
+                      request_timeout=DEFAULT_REQUEST_TIMEOUT, start_state=None, task="full", target_stage=7):
     """Every model response counts as one decision, whatever it contains.
 
     start_state: start from this cube state instead of a `depth` scramble
@@ -389,6 +412,9 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
     cost_limit (USD): stop once the episode's total cost goes over this.
     episode_timeout (s): wall-clock limit for the episode, including a call in
     progress; when hit, the episode ends with stop_reason "timeout".
+    request_timeout (s): deadline per API request attempt (retried up to
+    REQUEST_RETRIES times); when every attempt times out, the episode ends
+    with stop_reason "request_timeout".
     progress: print one short line per decision.
     reasoning_effort / reasoning_max_tokens / max_output_tokens: thinking
     settings sent with every request (see OpenRouterLLM) and recorded in
@@ -399,7 +425,7 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
     check_budgets(reasoning_max_tokens, max_output_tokens, reasoning_effort)
     llm = llm or OpenRouterLLM(model, reasoning_max_tokens=reasoning_max_tokens,
                                max_output_tokens=max_output_tokens,
-                               reasoning_effort=reasoning_effort)
+                               reasoning_effort=reasoning_effort, timeout=request_timeout)
     run_id = run_id or f"B_{model.replace('/', '_')}_s{seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -462,6 +488,8 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                 reply = call_with_deadline(lambda: llm(messages, TOOLS), remaining)
             except DeadlineExceeded:
                 reply, failure = {}, "timeout"
+            except RequestTimeout:  # every attempt of this request timed out
+                reply, failure = {}, "request_timeout"
             except Exception as exc:  # API failure after retries: end the episode, don't crash
                 reply, failure = {}, f"api_error: {type(exc).__name__}"
             latency_ms = round((time.perf_counter() - start) * 1000)
@@ -581,6 +609,7 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
         "reasoning_effort": reasoning_effort,
         "reasoning_max_tokens": reasoning_max_tokens,
         "max_output_tokens": max_output_tokens,
+        "request_timeout": request_timeout,
         "false_solved_claim": false_claim,
         "total_cost_usd": total_cost,
         "total_latency_ms": total_latency,
@@ -638,14 +667,15 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
                     run_id=None, raw_dir=RAW_DIR, episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True,
                     reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                     max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-                    reasoning_effort=DEFAULT_REASONING_EFFORT):
+                    reasoning_effort=DEFAULT_REASONING_EFFORT,
+                    request_timeout=DEFAULT_REQUEST_TIMEOUT):
     """Condition A: raw prompt, no tools, one call. Invalid tokens are skipped
     and counted; at most max_quarter_turns moves are applied. The one call
     counts as the one decision, even if it fails."""
     check_budgets(reasoning_max_tokens, max_output_tokens, reasoning_effort)
     llm = llm or OpenRouterLLM(model, reasoning_max_tokens=reasoning_max_tokens,
                                max_output_tokens=max_output_tokens,
-                               reasoning_effort=reasoning_effort)
+                               reasoning_effort=reasoning_effort, timeout=request_timeout)
     run_id = run_id or f"A_{model.replace('/', '_')}_s{seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -669,6 +699,8 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
             reply, error, stop_reason = None, reply["error"], "error_response"
     except DeadlineExceeded:
         reply, error, stop_reason = None, "timeout", "timeout"
+    except RequestTimeout:
+        reply, error, stop_reason = None, "request_timeout", "request_timeout"
     except Exception as exc:  # API failure after retries
         reply, stop_reason = None, f"api_error: {type(exc).__name__}"
         error = stop_reason
@@ -729,6 +761,7 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "reasoning_effort": reasoning_effort,
         "reasoning_max_tokens": reasoning_max_tokens,
         "max_output_tokens": max_output_tokens,
+        "request_timeout": request_timeout,
         "false_solved_claim": False,
         "total_cost_usd": cost or 0.0,
         "total_latency_ms": latency_ms,

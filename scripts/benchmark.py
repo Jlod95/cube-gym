@@ -12,6 +12,9 @@ Cost estimates are the average cost per episode for each (model, condition),
 taken from every log in results/raw. --max-cost counts only spend logged by
 benchmark episodes (run ids starting with "bench-"), including episodes that
 were interrupted.
+
+Episodes run --concurrency at a time (default 4). The --max-cost check counts
+the estimated cost of episodes still running before starting another one.
 """
 
 import argparse
@@ -19,6 +22,7 @@ import csv
 import json
 import sys
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -28,6 +32,7 @@ from harness import (  # noqa: E402
     DEFAULT_MAX_OUTPUT_TOKENS,
     DEFAULT_REASONING_EFFORT,
     DEFAULT_REASONING_MAX_TOKENS,
+    DEFAULT_REQUEST_TIMEOUT,
     RAW_DIR,
     REASONING_EFFORTS,
     ROOT,
@@ -39,6 +44,7 @@ from tasks import make_stage_task, parse_tasks, task_stage  # noqa: E402
 
 RESULTS_DIR = ROOT / "results"
 RUN_PREFIX = "bench-"
+DEFAULT_CONCURRENCY = 4
 FIELDS = ["model", "condition", "history", "task", "seed", "attempt", "run_id", "start_stage",
           "target_stage", "target_reached", "solved", "max_stage",
           "final_stage", "decisions", "quarter_turns", "invalid", "errors", "no_tool_calls",
@@ -147,7 +153,8 @@ def write_summaries(rows, results_dir):
 
 
 def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR,
-            episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True):
+            episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True,
+            request_timeout=DEFAULT_REQUEST_TIMEOUT):
     (model, condition, history, task, seed, attempt,
      reasoning_effort, reasoning_max_tokens, max_output_tokens) = key
     run_id = (f"{RUN_PREFIX}{condition}-{model.replace('/', '_')}-{task}-{history}-s{seed}"
@@ -155,11 +162,13 @@ def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR,
     budgets = thinking_arm(reasoning_effort, reasoning_max_tokens, max_output_tokens)
     if condition == "A":
         return run_episode_raw(model, seed, depth=depth, llm=llm, run_id=run_id, raw_dir=raw_dir,
-                               episode_timeout=episode_timeout, progress=progress, **budgets)
+                               episode_timeout=episode_timeout, progress=progress,
+                               request_timeout=request_timeout, **budgets)
     return run_episode_tools(model, seed, depth=depth, max_decisions=max_decisions,
                              history=history, llm=llm, run_id=run_id, raw_dir=raw_dir,
                              cost_limit=cost_limit, episode_timeout=episode_timeout,
-                             progress=progress, **budgets, **task_args(task, seed))
+                             progress=progress, request_timeout=request_timeout, **budgets,
+                             **task_args(task, seed))
 
 
 def task_args(task, seed):
@@ -174,7 +183,8 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
                   llm_factory=None, out=print, episode_timeout=DEFAULT_EPISODE_TIMEOUT, progress=True,
                   reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                   max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, tasks=("full",),
-                  stage_seeds=(), reasoning_effort=DEFAULT_REASONING_EFFORT, thinking_arms=None):
+                  stage_seeds=(), reasoning_effort=DEFAULT_REASONING_EFFORT, thinking_arms=None,
+                  concurrency=DEFAULT_CONCURRENCY, request_timeout=DEFAULT_REQUEST_TIMEOUT):
     """llm_factory(model) -> llm lets tests run without the network.
 
     thinking_arms: reasoning efforts to run every episode under (e.g.
@@ -221,38 +231,80 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
                 + ". Run scripts/smoke.py with these models to get one.")
         return completed
 
-    for i, key in enumerate(todo, 1):
-        model, condition, history_, task, seed, attempt, effort, *_ = key
-        est = estimates.get((model, condition))
-        cost_limit = None
-        if max_cost is not None:
-            if est is not None and spent + est > max_cost:
-                out(f"ABORT: spent ${spent:.4f} + estimated ${est:.4f} for the next episode "
-                    f"would exceed --max-cost ${max_cost:.2f}. Rerun to resume.")
+    # Up to `concurrency` episodes run at once, each in its own thread with its
+    # own log file (run ids are unique per episode). Only this thread records
+    # results and decides what to start next.
+    #
+    # --max-cost: before starting an episode, spend so far plus the estimated
+    # cost of every episode still running plus this one's estimate must fit.
+    # If it doesn't fit while others are running, wait for them (their actual
+    # cost may be lower); if nothing is running, abort. A condition B episode
+    # also gets a hard limit: the budget left after the spend so far and the
+    # other running episodes' estimates. An episode without an estimate only
+    # starts when nothing else is running, with the whole remaining budget as
+    # its hard limit.
+    pending = list(todo)
+    running = {}  # future -> (index, key, estimate reserved)
+    started = 0
+    stopping = False
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as pool:
+        while running or (pending and not stopping):
+            while pending and not stopping and len(running) < max(1, concurrency):
+                key = pending[0]
+                model, condition = key[0], key[1]
+                est = estimates.get((model, condition))
+                reserved = sum(r for _, _, r in running.values())
+                cost_limit = None
+                if max_cost is not None:
+                    if est is None:
+                        if running:
+                            break  # run it on its own once the others finish
+                        out(f"warning: no cost estimate for {model} {condition}; "
+                            f"relying on the remaining budget ${max_cost - spent:.4f} as a hard stop")
+                        cost_limit = max_cost - spent
+                    elif spent + reserved + est > max_cost:
+                        if running:
+                            break  # wait: running episodes may cost less than estimated
+                        out(f"ABORT: spent ${spent:.4f} + estimated ${est:.4f} for the next episode "
+                            f"would exceed --max-cost ${max_cost:.2f}. Rerun to resume.")
+                        stopping = True
+                        break
+                    else:
+                        cost_limit = max_cost - spent - reserved
+                pending.pop(0)
+                started += 1
+                llm = llm_factory(model) if llm_factory else None
+                future = pool.submit(run_one, key, depth, max_decisions, cost_limit, llm=llm,
+                                     raw_dir=raw_dir, episode_timeout=episode_timeout,
+                                     progress=progress, request_timeout=request_timeout)
+                running[future] = (started, key, est or 0.0)
+            if not running:
                 break
-            if est is None:
-                out(f"warning: no cost estimate for {model} {condition}; "
-                    f"relying on the remaining budget ${max_cost - spent:.4f} as a hard stop")
-            cost_limit = max_cost - spent
 
-        llm = llm_factory(model) if llm_factory else None
-        summary = run_one(key, depth, max_decisions, cost_limit, llm=llm, raw_dir=raw_dir,
-                          episode_timeout=episode_timeout, progress=progress)
-        spent += summary["total_cost_usd"]
-        out(f"[{i}/{len(todo)}] {condition} {task} {model} effort={effort} seed {seed} k{attempt}: "
-            f"target_reached={summary['target_reached']} max_stage={summary['max_stage']} "
-            f"${summary['total_cost_usd']:.4f} ({summary['stop_reason']}); spent ${spent:.4f}")
+            finished, _ = wait(running, return_when=FIRST_COMPLETED)
+            for future in finished:
+                i, key, _ = running.pop(future)
+                model, condition, history_, task, seed, attempt, effort, *_ = key
+                summary = future.result()
+                spent += summary["total_cost_usd"]
+                out(f"[{i}/{len(todo)}] {condition} {task} {model} effort={effort} seed {seed} "
+                    f"k{attempt}: target_reached={summary['target_reached']} "
+                    f"max_stage={summary['max_stage']} ${summary['total_cost_usd']:.4f} "
+                    f"({summary['stop_reason']}); spent ${spent:.4f}")
 
-        reason = summary["stop_reason"] or ""
-        if reason.startswith("api_error") or reason == "cost_limit":
-            out(f"ABORT: episode stopped with {reason}; not recorded. Rerun to resume.")
-            break
+                reason = summary["stop_reason"] or ""
+                if reason.startswith("api_error") or reason in ("cost_limit", "request_timeout"):
+                    out(f"ABORT: episode stopped with {reason}; not recorded. "
+                        f"{'Waiting for running episodes, then stopping. ' if running else ''}"
+                        f"Rerun to resume.")
+                    stopping = True
+                    continue
 
-        row = {"model": model, "condition": condition, "history": history_, "seed": seed,
-               "attempt": attempt, **summary}  # summary carries task, start_stage, ...
-        with open(episodes_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
-        completed.append(row)
+                row = {"model": model, "condition": condition, "history": history_, "seed": seed,
+                       "attempt": attempt, **summary}  # summary carries task, start_stage, ...
+                with open(episodes_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(row) + "\n")
+                completed.append(row)
 
     write_summaries(completed, results_dir)
     out(f"wrote {results_dir / 'summary.csv'} and summary.json ({len(completed)} episodes)")
@@ -302,6 +354,13 @@ def add_thinking_args(p, arms=False):
                         f"{DEFAULT_MAX_OUTPUT_TOKENS}); 'none' sends no cap")
 
 
+def add_request_timeout_arg(p):
+    """Shared by benchmark.py and smoke.py."""
+    p.add_argument("--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT,
+                   help=f"wall-clock seconds per API request attempt, retried up to 3 times "
+                        f"(default {DEFAULT_REQUEST_TIMEOUT})")
+
+
 def resolve_effort(p, a):
     """The effort to use: the default, unless --reasoning-max-tokens asks for
     a token budget instead. Both set explicitly is an error."""
@@ -331,6 +390,9 @@ def main():
     p.add_argument("--episode-timeout", type=float, default=DEFAULT_EPISODE_TIMEOUT,
                    help=f"wall-clock seconds per episode (default {DEFAULT_EPISODE_TIMEOUT})")
     p.add_argument("--quiet", action="store_true", help="no per-decision progress lines")
+    p.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
+                   help=f"episodes run in parallel (default {DEFAULT_CONCURRENCY})")
+    add_request_timeout_arg(p)
     add_thinking_args(p, arms=True)
     a = p.parse_args()
     effort = resolve_effort(p, a)
@@ -342,7 +404,8 @@ def main():
                   reasoning_max_tokens=a.reasoning_max_tokens,
                   max_output_tokens=a.max_output_tokens, tasks=parse_tasks(a.tasks),
                   stage_seeds=parse_seeds(a.stage_seeds), reasoning_effort=effort,
-                  thinking_arms=a.thinking_arms)
+                  thinking_arms=a.thinking_arms, concurrency=a.concurrency,
+                  request_timeout=a.request_timeout)
 
 
 if __name__ == "__main__":

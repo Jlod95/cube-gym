@@ -143,3 +143,93 @@ def test_cli_effort_resolution():
         parse("--reasoning-effort", "low", "--reasoning-max-tokens", "1500")
     with pytest.raises(SystemExit):
         parse("--reasoning-effort", "high")
+
+
+# --- concurrency ------------------------------------------------------------
+
+
+class ParallelProbe:
+    """llm_factory whose fake models sleep and record how many run at once."""
+
+    def __init__(self, cost=0.01, sleep=0.2):
+        import threading
+
+        self.cost, self.sleep = cost, sleep
+        self.lock = threading.Lock()
+        self.active = self.peak = 0
+
+    def __call__(self, model):
+        import time
+
+        def llm(messages, tools):
+            with self.lock:
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            time.sleep(self.sleep)
+            with self.lock:
+                self.active -= 1
+            return {"content": "Stopping." if tools else "MOVES: U", "tool_calls": [],
+                    "usage": {"input_tokens": 1, "output_tokens": 1, "cost": self.cost}}
+        return llm
+
+
+def run_parallel(tmp_path, probe, **kwargs):
+    lines = []
+    rows = benchmark.run_benchmark(["m/x"], ["A"], kwargs.pop("seeds", list(range(1, 9))),
+                                   results_dir=tmp_path / "results", raw_dir=tmp_path / "raw",
+                                   llm_factory=probe, out=lines.append, progress=False, **kwargs)
+    return rows, "\n".join(lines)
+
+
+def test_concurrency_runs_episodes_in_parallel_with_separate_logs(tmp_path):
+    probe = ParallelProbe()
+    rows, _ = run_parallel(tmp_path, probe, concurrency=4)
+    assert len(rows) == 8
+    assert probe.peak == 4
+    logs = sorted(p.name for p in (tmp_path / "raw").glob("bench-*.jsonl"))
+    assert len(logs) == 8 and len(set(logs)) == 8
+    for path in (tmp_path / "raw").glob("bench-*.jsonl"):
+        assert len(path.read_text().splitlines()) == 1  # one episode per file
+
+
+def test_concurrency_one_is_serial(tmp_path):
+    probe = ParallelProbe(sleep=0.05)
+    rows, _ = run_parallel(tmp_path, probe, seeds=[1, 2, 3], concurrency=1)
+    assert len(rows) == 3 and probe.peak == 1
+
+
+def test_concurrency_respects_max_cost(tmp_path):
+    # Estimate $0.10 per A episode; budget $0.25 fits two at once, not three.
+    write_raw(tmp_path / "raw", "smoke-est", "m/x", "A", [0.10])
+    probe = ParallelProbe(cost=0.10)
+    rows, text = run_parallel(tmp_path, probe, concurrency=4, max_cost=0.25)
+    assert probe.peak == 2  # running episodes' estimates are counted
+    assert len(rows) == 2
+    assert "ABORT: spent $0.2000 + estimated $0.1000" in text
+    spent = sum(r["total_cost_usd"] for r in rows)
+    assert spent <= 0.25
+
+
+def test_concurrency_waits_for_running_episodes_before_aborting(tmp_path):
+    # Running episodes cost less than estimated, so more can start once they finish.
+    write_raw(tmp_path / "raw", "smoke-est", "m/x", "A", [0.10])
+    probe = ParallelProbe(cost=0.01)
+    rows, text = run_parallel(tmp_path, probe, seeds=[1, 2, 3, 4], concurrency=4, max_cost=0.25)
+    assert probe.peak == 2
+    assert len(rows) == 4 and "ABORT" not in text
+
+
+def test_episode_without_estimate_runs_alone_under_max_cost(tmp_path):
+    probe = ParallelProbe(sleep=0.05)
+    rows, text = run_parallel(tmp_path, probe, seeds=[1, 2, 3], concurrency=4, max_cost=1.0)
+    assert len(rows) == 3 and probe.peak == 1
+    assert "no cost estimate" in text
+
+
+def test_request_timeout_flag():
+    import argparse
+
+    p = argparse.ArgumentParser()
+    benchmark.add_request_timeout_arg(p)
+    assert p.parse_args([]).request_timeout == 180
+    assert p.parse_args(["--request-timeout", "300"]).request_timeout == 300

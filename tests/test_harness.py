@@ -164,7 +164,7 @@ def test_retries_then_succeeds(monkeypatch):
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     llm = harness.OpenRouterLLM(MODEL, client=client, backoff=0)
     assert llm([], [])["content"] == "hi"
-    assert attempts == [60, 60, 60]
+    assert attempts == [180, 180, 180]  # default request deadline (was 60 s)
 
 
 def test_raw_condition_solves_with_moves_line(tmp_path):
@@ -277,7 +277,7 @@ def test_openrouter_call_has_hard_deadline():
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
     llm = harness.OpenRouterLLM(MODEL, client=client, timeout=0.2, retries=1, backoff=0)
     start = time.monotonic()
-    with pytest.raises(harness.DeadlineExceeded):
+    with pytest.raises(harness.RequestTimeout, match="all 2 attempts timed out"):
         llm([], [])
     assert time.monotonic() - start < 1.5
     assert len(kwargs_seen) == 2  # first attempt + 1 retry
@@ -589,3 +589,66 @@ def test_raw_declined_reply(tmp_path):
     assert summary["stop_reason"] == "declined" and summary["invalid"] == 1
     rec = read_log(summary)[0]
     assert rec["parse_error"] == "declined" and rec["reply_text"] == text
+
+
+# --- configurable request deadline --------------------------------------------
+
+
+def test_request_timeout_default_and_passed_to_client(tmp_path, monkeypatch):
+    calls = fake_openai(monkeypatch)
+    raw = harness.run_episode_raw(MODEL, SEED, raw_dir=tmp_path, progress=False)
+    tools = harness.run_episode_tools(MODEL, SEED, depth=10, max_decisions=1, raw_dir=tmp_path,
+                                      progress=False, request_timeout=240)
+    assert calls[0]["timeout"] == 180 and calls[1]["timeout"] == 240
+    assert raw["request_timeout"] == 180 and tools["request_timeout"] == 240
+    rec = read_log(tools)[0]
+    assert rec["attempts"] == 1 and rec["timed_out_attempts"] == 0
+
+
+def test_request_deadline_configurable_and_retried():
+    import time
+
+    seen = []
+
+    def create(**kwargs):
+        seen.append(kwargs["timeout"])
+        if len(seen) == 1:
+            time.sleep(2)  # first attempt hangs past the deadline
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None),
+                                     finish_reason="stop")],
+            usage=None)
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    llm = harness.OpenRouterLLM(MODEL, client=client, timeout=0.3, backoff=0)
+    reply = llm([], [])
+    assert reply["content"] == "ok"
+    assert reply["attempts"] == 2 and reply["timed_out_attempts"] == 1
+    assert seen == [0.3, 0.3]
+
+
+def test_request_timeout_stop_reason_differs_from_episode_timeout(tmp_path):
+    def stuck(messages, tools):
+        raise harness.RequestTimeout("all 4 attempts timed out after 180 s each")
+
+    b = run(stuck, tmp_path, depth=10)
+    assert b["stop_reason"] == "request_timeout"
+    assert read_log(b)[-1]["error"] == "request_timeout"
+    a = harness.run_episode_raw(MODEL, SEED, llm=stuck, raw_dir=tmp_path, progress=False)
+    assert a["stop_reason"] == "request_timeout"
+
+    import time
+
+    def slow(messages, tools):
+        time.sleep(5)
+
+    assert run(slow, tmp_path, depth=10, episode_timeout=0.3)["stop_reason"] == "timeout"
+
+
+def test_smoke_has_request_timeout_flag():
+    import subprocess
+
+    out = subprocess.run([sys.executable, str(Path(__file__).resolve().parent.parent / "scripts"
+                                              / "smoke.py"), "--help"],
+                         capture_output=True, text=True, check=True).stdout
+    assert "--request-timeout" in out and "default 180" in out.replace("\n", " ").replace("  ", " ")
