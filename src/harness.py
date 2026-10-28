@@ -120,8 +120,15 @@ class OpenRouterLLM:
 
     def __init__(self, model, client=None, timeout=60, retries=3, backoff=2.0,
                  reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
-                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
+                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, reasoning_effort=None):
+        """reasoning_effort ("none", "minimal", "low", ...): if given, sent as
+        `reasoning: {"effort": ...}` instead of the token budget, which is
+        then ignored. Used by scripts/budget_probe.py; the harness doesn't
+        set it."""
+        if reasoning_effort is not None:
+            reasoning_max_tokens = None
         check_budgets(reasoning_max_tokens, max_output_tokens)
+        self.reasoning_effort = reasoning_effort
         self.model = model
         self.timeout = timeout
         self.retries = retries
@@ -149,7 +156,9 @@ class OpenRouterLLM:
         if self.max_output_tokens is not None:
             extra["max_tokens"] = self.max_output_tokens
         body = {}
-        if self.reasoning_max_tokens is not None:
+        if self.reasoning_effort is not None:
+            body["reasoning"] = {"effort": self.reasoning_effort}
+        elif self.reasoning_max_tokens is not None:
             body["reasoning"] = ({"effort": "none"} if self.reasoning_max_tokens == 0
                                  else {"max_tokens": self.reasoning_max_tokens})
         rejected = None
@@ -187,7 +196,8 @@ class OpenRouterLLM:
             # OpenRouter reports cost in credits (1 credit = 1 USD).
             "cost": getattr(usage, "cost", None),
         } if usage is not None else None
-        status = rejected or reasoning_status(self.reasoning_max_tokens, reasoning_tokens)
+        status = rejected or reasoning_status(self.reasoning_max_tokens, reasoning_tokens,
+                                              self.reasoning_effort)
 
         choices = getattr(resp, "choices", None)
         error = getattr(resp, "error", None)
@@ -208,8 +218,14 @@ class OpenRouterLLM:
         }
 
 
-def reasoning_status(budget, used):
-    """How the reasoning budget fared, judged from the reported token count."""
+def reasoning_status(budget, used, effort=None):
+    """How the reasoning setting fared, judged from the reported token count."""
+    if effort is not None:
+        if used is None:
+            return "not_reported"
+        if effort == "none" and used > 0:
+            return f"ignored: used {used} with effort none"
+        return f"ok (effort {effort})"
     if budget is None:
         return "not_sent"
     if used is None:
