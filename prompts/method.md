@@ -218,6 +218,13 @@ While you are partway through, the lower layers will look scrambled. **This is
 expected; do not try to fix them.** They come back by themselves once every top
 corner has been twisted correctly.
 
+**What to watch in stage 7:** the yellow sticker of the top front-right corner,
+not the lower layers (and not the stage count, which drops while the lower
+layers are scrambled). After every action the feedback includes a line
+`yellow stickers facing up: n/9`, counting the yellow stickers on the U face.
+It rises as each corner is twisted into place and reaches 9/9 when every top
+corner has yellow up; then finish with the U turn that solves the cube.
+
 ## General advice
 
 - Before each action, identify which stage you are on: the first one that isn't

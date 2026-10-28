@@ -3,6 +3,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -79,8 +81,8 @@ def test_max_cost_aborts_before_episode(tmp_path):
 
 
 def test_budgets_in_summary_and_part_of_resume_key(tmp_path):
-    rows, _ = run(tmp_path, conditions=["A"], seeds=[1], reasoning_max_tokens=1000,
-                  max_output_tokens=2000)
+    rows, _ = run(tmp_path, conditions=["A"], seeds=[1], reasoning_effort=None,
+                  reasoning_max_tokens=1000, max_output_tokens=2000)
     with open(tmp_path / "results" / "summary.csv", encoding="utf-8") as f:
         row = next(csv.DictReader(f))
     assert row["reasoning_max_tokens"] == "1000" and row["max_output_tokens"] == "2000"
@@ -99,3 +101,45 @@ def test_summary_has_loop_and_reply_columns(tmp_path):
     for col in ("revisits", "no_tool_calls", "truncated"):
         assert col in row
     assert row["no_tool_calls"] == "3"  # the fake never calls a tool
+
+
+def test_default_effort_in_summary(tmp_path):
+    run(tmp_path, conditions=["A"], seeds=[1])
+    with open(tmp_path / "results" / "summary.csv", encoding="utf-8") as f:
+        row = next(csv.DictReader(f))
+    assert row["reasoning_effort"] == "low" and row["max_output_tokens"] == "8000"
+    assert row["reasoning_max_tokens"] == ""
+
+
+def test_thinking_arms_run_same_tasks_under_each_setting(tmp_path):
+    rows, text = run(tmp_path, conditions=["A", "B"], seeds=[1, 2], thinking_arms=["low", "none"])
+    assert len(rows) == 8  # 2 conditions x 2 seeds x 2 arms
+    by_arm = {}
+    for r in rows:
+        by_arm.setdefault(r["reasoning_effort"], set()).add((r["condition"], r["seed"]))
+    assert by_arm["low"] == by_arm["none"] == {("A", 1), ("A", 2), ("B", 1), ("B", 2)}
+    assert "thinking arms: effort low, output cap 8000; effort none, output cap 8000" in text
+
+    # The effort is part of the resume key: adding an arm only runs the new arm.
+    rows, text = run(tmp_path, conditions=["A", "B"], seeds=[1, 2], thinking_arms=["low", None])
+    assert "4 already done; 4 to run" in text
+
+
+def test_cli_effort_resolution():
+    import argparse
+
+    def parse(*args):
+        p = argparse.ArgumentParser()
+        benchmark.add_thinking_args(p, arms=True)
+        a = p.parse_args(list(args))
+        return benchmark.resolve_effort(p, a), a
+
+    assert parse()[0] == "low"
+    assert parse("--reasoning-effort", "none")[0] == "none"
+    assert parse("--reasoning-effort", "unset")[0] is None
+    assert parse("--reasoning-max-tokens", "1500")[0] is None  # token budget instead
+    assert parse("--thinking-arms", "low,none,unset")[1].thinking_arms == ["low", "none", None]
+    with pytest.raises(SystemExit):
+        parse("--reasoning-effort", "low", "--reasoning-max-tokens", "1500")
+    with pytest.raises(SystemExit):
+        parse("--reasoning-effort", "high")

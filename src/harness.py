@@ -27,8 +27,14 @@ RAW_PROMPT = ROOT / "prompts" / "raw.md"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 MODELS_URL = OPENROUTER_BASE_URL + "/models"
 MAX_TIMES = 6
-DEFAULT_REASONING_MAX_TOKENS = 2000
-DEFAULT_MAX_OUTPUT_TOKENS = 4000
+# Default thinking setting: reasoning effort "low", output cap 8000 (reasoning
+# included). A token budget for reasoning (reasoning_max_tokens) is still
+# available, but not the default; it can't be combined with an effort.
+DEFAULT_REASONING_EFFORT = "low"
+DEFAULT_REASONING_MAX_TOKENS = None
+DEFAULT_MAX_OUTPUT_TOKENS = 8000
+REASONING_EFFORTS = ("low", "none")  # offered on the command line, plus "unset"
+YELLOW_UP_LABEL = "yellow stickers facing up"
 NO_TOOL_CALL_LIMIT = 3  # replies in a row without a tool call that end an episode
 NO_TOOL_CALL_LIMIT_WORDS = "Three"  # as written in prompts/method.md
 NO_TOOL_CALL_NUDGE = "Your last reply had no tool call. Reply with exactly one tool call."
@@ -110,24 +116,21 @@ class OpenRouterLLM:
     payload) is returned as {"error": ...} rather than raised, so the harness
     counts it as a decision.
 
-    Budgets sent with every request:
+    Settings sent with every request:
       max_output_tokens -> `max_tokens` (covers reasoning + visible output)
-      reasoning_max_tokens -> `reasoning: {"max_tokens": N}`, or
-                              `{"effort": "none"}` when 0; None sends nothing.
+      reasoning_effort -> `reasoning: {"effort": ...}` (default "low"), or
+      reasoning_max_tokens -> `reasoning: {"max_tokens": N}` (`{"effort":
+                              "none"}` when 0), used only with effort None.
+      None for both sends no reasoning setting.
     If the provider rejects the reasoning setting (HTTP 400), the request is
     resent without it and the reply's reasoning_status says "rejected: ...".
     """
 
     def __init__(self, model, client=None, timeout=60, retries=3, backoff=2.0,
                  reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
-                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, reasoning_effort=None):
-        """reasoning_effort ("none", "minimal", "low", ...): if given, sent as
-        `reasoning: {"effort": ...}` instead of the token budget, which is
-        then ignored. Used by scripts/budget_probe.py; the harness doesn't
-        set it."""
-        if reasoning_effort is not None:
-            reasoning_max_tokens = None
-        check_budgets(reasoning_max_tokens, max_output_tokens)
+                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                 reasoning_effort=DEFAULT_REASONING_EFFORT):
+        check_budgets(reasoning_max_tokens, max_output_tokens, reasoning_effort)
         self.reasoning_effort = reasoning_effort
         self.model = model
         self.timeout = timeout
@@ -235,16 +238,20 @@ def reasoning_status(budget, used, effort=None):
     return "ok"
 
 
-def check_budgets(reasoning_max_tokens, max_output_tokens):
-    """max_tokens covers reasoning too, and Anthropic requires it to be strictly
-    larger than the reasoning budget."""
+def check_budgets(reasoning_max_tokens, max_output_tokens, reasoning_effort=None):
+    """Effort and a reasoning token budget are alternatives (OpenRouter takes
+    one or the other). max_tokens covers reasoning too, and Anthropic requires
+    it to be strictly larger than the reasoning budget."""
+    if reasoning_effort is not None and reasoning_max_tokens is not None:
+        raise ValueError("set either reasoning_effort or reasoning_max_tokens, not both "
+                         f"(got {reasoning_effort!r} and {reasoning_max_tokens!r})")
     if (reasoning_max_tokens is not None and max_output_tokens is not None
             and reasoning_max_tokens >= max_output_tokens):
         raise ValueError(f"max_output_tokens ({max_output_tokens}) must be larger than "
                          f"reasoning_max_tokens ({reasoning_max_tokens})")
 
 
-def reasoning_fields(reply, reasoning_max_tokens, max_output_tokens):
+def reasoning_fields(reply, reasoning_max_tokens, max_output_tokens, reasoning_effort):
     """Per-call log fields: reasoning tokens apart from other output, the
     budgets in force, and whether the reasoning setting took effect."""
     usage = reply.get("usage") or {}
@@ -255,6 +262,7 @@ def reasoning_fields(reply, reasoning_max_tokens, max_output_tokens):
         "visible_output_tokens": output - (reasoning or 0),
         "reasoning_status": reply.get("reasoning_status"),
         "finish_reason": reply.get("finish_reason"),
+        "reasoning_effort": reasoning_effort,
         "reasoning_max_tokens": reasoning_max_tokens,
         "max_output_tokens": max_output_tokens,
     }
@@ -329,6 +337,13 @@ def stage_line(state):
     return f"stages complete: {n}/7 ({names})"
 
 
+def yellow_up_line(state):
+    """Stage 7 cue: how many U-face stickers are yellow (9 when every top
+    corner and edge has yellow facing up)."""
+    yellow = state[4]  # U centre
+    return f"{YELLOW_UP_LABEL}: {sum(state[i] == yellow for i in range(9))}/9"
+
+
 def state_text(state):
     return f"{observation(state)}\n\n{stage_line(state)}"
 
@@ -360,7 +375,7 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                       cost_limit=None, episode_timeout=600, progress=True,
                       reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                       max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
-                      start_state=None, task="full", target_stage=7):
+                      reasoning_effort=DEFAULT_REASONING_EFFORT, start_state=None, task="full", target_stage=7):
     """Every model response counts as one decision, whatever it contains.
 
     start_state: start from this cube state instead of a `depth` scramble
@@ -372,14 +387,16 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
     episode_timeout (s): wall-clock limit for the episode, including a call in
     progress; when hit, the episode ends with stop_reason "timeout".
     progress: print one short line per decision.
-    reasoning_max_tokens / max_output_tokens: budgets sent with every request
-    (see OpenRouterLLM) and recorded in every log line.
+    reasoning_effort / reasoning_max_tokens / max_output_tokens: thinking
+    settings sent with every request (see OpenRouterLLM) and recorded in
+    every log line and the summary.
     """
     if history not in ("window", "full"):
         raise ValueError(f"history must be 'window' or 'full', got {history!r}")
-    check_budgets(reasoning_max_tokens, max_output_tokens)
+    check_budgets(reasoning_max_tokens, max_output_tokens, reasoning_effort)
     llm = llm or OpenRouterLLM(model, reasoning_max_tokens=reasoning_max_tokens,
-                               max_output_tokens=max_output_tokens)
+                               max_output_tokens=max_output_tokens,
+                               reasoning_effort=reasoning_effort)
     run_id = run_id or f"B_{model.replace('/', '_')}_s{seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -449,7 +466,8 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
 
             in_tok, out_tok, cost, cost_source = reply_cost(model, reply)
             total_cost += cost or 0.0
-            extra_fields = reasoning_fields(reply, reasoning_max_tokens, max_output_tokens)
+            extra_fields = reasoning_fields(reply, reasoning_max_tokens, max_output_tokens,
+                                            reasoning_effort)
             reasoning_total += extra_fields["reasoning_tokens"] or 0
 
             calls = reply.get("tool_calls") or []
@@ -525,7 +543,7 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
             if progress:
                 progress_line(model, seed, decisions, action + ("" if valid else " INVALID"),
                               stages, total_cost)
-            recent.append((action, f"{result} {stage_line(env.state)}"))
+            recent.append((action, f"{result} {stage_line(env.state)}; {yellow_up_line(env.state)}"))
             conversation.append({
                 "role": "assistant", "content": reply.get("content"),
                 "tool_calls": [{"id": c["id"], "type": "function",
@@ -533,7 +551,8 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
                                for c in calls],
             })
             conversation.append({"role": "tool", "tool_call_id": call["id"],
-                                 "content": f"{result}\n\n{state_text(env.state)}"})
+                                 "content": f"{result}\n{yellow_up_line(env.state)}\n\n"
+                                            f"{state_text(env.state)}"})
             for extra in calls[1:]:
                 conversation.append({"role": "tool", "tool_call_id": extra["id"],
                                      "content": "Error: only one tool call per turn; this call was not run."})
@@ -556,6 +575,7 @@ def run_episode_tools(model, seed, depth=25, max_decisions=60, max_quarter_turns
         "truncated": truncated,
         "revisits": revisits,
         "reasoning_tokens": reasoning_total,
+        "reasoning_effort": reasoning_effort,
         "reasoning_max_tokens": reasoning_max_tokens,
         "max_output_tokens": max_output_tokens,
         "false_solved_claim": false_claim,
@@ -614,13 +634,15 @@ def parse_moves_reply(text):
 def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
                     run_id=None, raw_dir=RAW_DIR, episode_timeout=600, progress=True,
                     reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
-                    max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
+                    max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS,
+                    reasoning_effort=DEFAULT_REASONING_EFFORT):
     """Condition A: raw prompt, no tools, one call. Invalid tokens are skipped
     and counted; at most max_quarter_turns moves are applied. The one call
     counts as the one decision, even if it fails."""
-    check_budgets(reasoning_max_tokens, max_output_tokens)
+    check_budgets(reasoning_max_tokens, max_output_tokens, reasoning_effort)
     llm = llm or OpenRouterLLM(model, reasoning_max_tokens=reasoning_max_tokens,
-                               max_output_tokens=max_output_tokens)
+                               max_output_tokens=max_output_tokens,
+                               reasoning_effort=reasoning_effort)
     run_id = run_id or f"A_{model.replace('/', '_')}_s{seed}_{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -634,10 +656,12 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
 
     start = time.perf_counter()
     error = None
-    extra_fields = reasoning_fields({}, reasoning_max_tokens, max_output_tokens)
+    extra_fields = reasoning_fields({}, reasoning_max_tokens, max_output_tokens,
+                                    reasoning_effort)
     try:
         reply = call_with_deadline(lambda: llm(messages, None), episode_timeout)
-        extra_fields = reasoning_fields(reply, reasoning_max_tokens, max_output_tokens)
+        extra_fields = reasoning_fields(reply, reasoning_max_tokens, max_output_tokens,
+                                            reasoning_effort)
         if reply.get("error"):
             reply, error, stop_reason = None, reply["error"], "error_response"
     except DeadlineExceeded:
@@ -698,6 +722,7 @@ def run_episode_raw(model, seed, depth=25, max_quarter_turns=300, llm=None,
         "invalid": len(bad) + (stop_reason in ("no_moves_line", "truncated")),
         "errors": int(error is not None),
         "reasoning_tokens": extra_fields["reasoning_tokens"] or 0,
+        "reasoning_effort": reasoning_effort,
         "reasoning_max_tokens": reasoning_max_tokens,
         "max_output_tokens": max_output_tokens,
         "false_solved_claim": False,

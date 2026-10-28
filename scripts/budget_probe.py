@@ -38,8 +38,10 @@ from harness import (  # noqa: E402
 from tasks import make_stage_task  # noqa: E402
 
 SETTINGS = {
-    "a: reasoning 2000 / out 4000": {"reasoning_max_tokens": 2000, "max_output_tokens": 4000},
-    "b: reasoning 1024 / out 8000": {"reasoning_max_tokens": 1024, "max_output_tokens": 8000},
+    "a: reasoning 2000 / out 4000": {"reasoning_effort": None, "reasoning_max_tokens": 2000,
+                                     "max_output_tokens": 4000},
+    "b: reasoning 1024 / out 8000": {"reasoning_effort": None, "reasoning_max_tokens": 1024,
+                                     "max_output_tokens": 8000},
     "c: effort low / out 8000": {"reasoning_effort": "low", "max_output_tokens": 8000},
     "d: reasoning off / out 2000": {"reasoning_effort": "none", "max_output_tokens": 2000},
 }

@@ -62,3 +62,11 @@ def test_method_states_harness_limits():
 
 def test_method_states_last_layer_up_to_u_turn():
     assert "The last layer counts as done up to a final U turn" in METHOD
+
+
+def test_method_explains_yellow_up_cue():
+    from harness import YELLOW_UP_LABEL
+
+    stage7 = METHOD[METHOD.index("### Stage 7"):METHOD.index("## General advice")]
+    assert f"`{YELLOW_UP_LABEL}: n/9`" in stage7
+    assert "top front-right corner" in stage7 and "not the lower layers" in stage7

@@ -21,9 +21,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from benchmark import parse_seeds, plan_episodes, task_args, token_budget  # noqa: E402
+from benchmark import (  # noqa: E402
+    add_thinking_args,
+    describe_arm,
+    parse_seeds,
+    plan_episodes,
+    resolve_effort,
+    task_args,
+    thinking_arm,
+)
 from harness import (  # noqa: E402
     DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_REASONING_EFFORT,
     DEFAULT_REASONING_MAX_TOKENS,
     RAW_DIR,
     run_episode_raw,
@@ -35,12 +44,11 @@ from tasks import parse_tasks  # noqa: E402
 def run_smoke(model, seeds=(1, 2), tasks=("full",), stage_seeds=(1,), max_cost=0.20,
               reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
               max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, progress=True, llm=None,
-              raw_dir=RAW_DIR, out=print):
+              raw_dir=RAW_DIR, out=print, reasoning_effort=DEFAULT_REASONING_EFFORT):
     """Run the smoke episodes; return [(key, summary)]. `llm` is for tests."""
-    budgets = {"reasoning_max_tokens": reasoning_max_tokens, "max_output_tokens": max_output_tokens}
-    plan = plan_episodes([model], ["A", "B"], seeds, 1, "window", reasoning_max_tokens,
-                         max_output_tokens, tasks, stage_seeds)
-    out(f"budgets: {budgets}")
+    budgets = thinking_arm(reasoning_effort, reasoning_max_tokens, max_output_tokens)
+    plan = plan_episodes([model], ["A", "B"], seeds, 1, "window", [budgets], tasks, stage_seeds)
+    out(f"thinking: {describe_arm(budgets)}")
     out(f"planned {len(plan)} episodes, max cost ${max_cost:.2f}")
 
     results = []
@@ -96,13 +104,11 @@ def main():
     p.add_argument("--stage-seeds", default="1", help="seeds for stage tasks")
     p.add_argument("--max-cost", type=float, default=0.20, help="USD; stop once total goes over")
     p.add_argument("--quiet", action="store_true", help="no per-decision progress lines")
-    p.add_argument("--reasoning-max-tokens", type=token_budget, default=DEFAULT_REASONING_MAX_TOKENS,
-                   help="reasoning budget per call; 0 asks for no reasoning, 'none' sends no setting")
-    p.add_argument("--max-output-tokens", type=token_budget, default=DEFAULT_MAX_OUTPUT_TOKENS,
-                   help="output cap per call, reasoning included; 'none' sends no cap")
+    add_thinking_args(p)
     a = p.parse_args()
     run_smoke(a.model, parse_seeds(a.seeds), parse_tasks(a.tasks), parse_seeds(a.stage_seeds),
-              a.max_cost, a.reasoning_max_tokens, a.max_output_tokens, progress=not a.quiet)
+              a.max_cost, a.reasoning_max_tokens, a.max_output_tokens, progress=not a.quiet,
+              reasoning_effort=resolve_effort(p, a))
 
 
 if __name__ == "__main__":

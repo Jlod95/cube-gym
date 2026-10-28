@@ -1,4 +1,3 @@
-import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,11 +72,14 @@ def test_effort_setting_sent(monkeypatch):
     assert [s["max_tokens"] for s in sent] == [4000, 8000, 8000, 2000]
 
 
-def test_harness_defaults_unchanged():
+def test_harness_defaults():
+    # The defaults were changed on purpose to effort "low" with an 8000 cap;
+    # a reasoning token budget is available but not the default.
     import inspect
 
-    assert harness.DEFAULT_REASONING_MAX_TOKENS == 2000
-    assert harness.DEFAULT_MAX_OUTPUT_TOKENS == 4000
+    assert harness.DEFAULT_REASONING_EFFORT == "low"
+    assert harness.DEFAULT_REASONING_MAX_TOKENS is None
+    assert harness.DEFAULT_MAX_OUTPUT_TOKENS == 8000
     params = inspect.signature(harness.OpenRouterLLM).parameters
-    assert params["reasoning_effort"].default is None
-    assert json.dumps(params["reasoning_max_tokens"].default) == "2000"
+    assert params["reasoning_effort"].default == "low"
+    assert params["reasoning_max_tokens"].default is None

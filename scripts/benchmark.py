@@ -25,9 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from harness import (  # noqa: E402
     DEFAULT_MAX_OUTPUT_TOKENS,
+    DEFAULT_REASONING_EFFORT,
     DEFAULT_REASONING_MAX_TOKENS,
     RAW_DIR,
+    REASONING_EFFORTS,
     ROOT,
+    check_budgets,
     run_episode_raw,
     run_episode_tools,
 )
@@ -37,7 +40,8 @@ RESULTS_DIR = ROOT / "results"
 RUN_PREFIX = "bench-"
 FIELDS = ["model", "condition", "history", "task", "seed", "attempt", "run_id", "start_stage",
           "target_stage", "target_reached", "solved", "max_stage",
-          "final_stage", "decisions", "quarter_turns", "invalid", "errors", "no_tool_calls", "truncated", "revisits", "reasoning_tokens", "reasoning_max_tokens",
+          "final_stage", "decisions", "quarter_turns", "invalid", "errors", "no_tool_calls",
+          "truncated", "revisits", "reasoning_tokens", "reasoning_effort", "reasoning_max_tokens",
           "max_output_tokens", "false_solved_claim",
           "total_cost_usd", "total_latency_ms", "stop_reason"]
 
@@ -55,30 +59,45 @@ def parse_seeds(text):
     return sorted(seeds)
 
 
-def episode_key(model, condition, history, task, seed, attempt, reasoning_max_tokens,
-                max_output_tokens):
-    """Budgets are part of the key: the same seed under another budget is a
-    different episode, never skipped as already done."""
+def episode_key(model, condition, history, task, seed, attempt, reasoning_effort,
+                reasoning_max_tokens, max_output_tokens):
+    """The thinking setting is part of the key: the same seed under another
+    setting is a different episode, never skipped as already done."""
     return (model, condition, history if condition == "B" else "-", task, seed, attempt,
-            reasoning_max_tokens, max_output_tokens)
+            reasoning_effort, reasoning_max_tokens, max_output_tokens)
 
 
 def row_key(r):
     return episode_key(r["model"], r["condition"], r["history"], r.get("task", "full"), r["seed"],
-                       r["attempt"], r.get("reasoning_max_tokens"), r.get("max_output_tokens"))
+                       r["attempt"], r.get("reasoning_effort"), r.get("reasoning_max_tokens"),
+                       r.get("max_output_tokens"))
 
 
-def plan_episodes(models, conditions, seeds, k, history, reasoning_max_tokens, max_output_tokens,
-                  tasks=("full",), stage_seeds=()):
+def thinking_arm(reasoning_effort=DEFAULT_REASONING_EFFORT,
+                 reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
+                 max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS):
+    """One thinking setting, as the harness's keyword arguments."""
+    check_budgets(reasoning_max_tokens, max_output_tokens, reasoning_effort)
+    return {"reasoning_effort": reasoning_effort, "reasoning_max_tokens": reasoning_max_tokens,
+            "max_output_tokens": max_output_tokens}
+
+
+def plan_episodes(models, conditions, seeds, k, history, arms=None, tasks=("full",),
+                  stage_seeds=()):
     """Full tasks run in every condition on `seeds`; stage tasks run in
-    condition B only, on `stage_seeds`."""
+    condition B only, on `stage_seeds`. Every episode runs once per thinking
+    arm (default: the single default setting)."""
+    arms = arms or [thinking_arm()]
     plan = []
     for m in models:
-        for task in tasks:
-            task_conditions = conditions if task == "full" else [c for c in conditions if c == "B"]
-            task_seeds = seeds if task == "full" else stage_seeds
-            plan += [episode_key(m, c, history, task, s, a, reasoning_max_tokens, max_output_tokens)
-                     for c in task_conditions for s in task_seeds for a in range(1, k + 1)]
+        for arm in arms:
+            for task in tasks:
+                task_conditions = (conditions if task == "full"
+                                   else [c for c in conditions if c == "B"])
+                task_seeds = seeds if task == "full" else stage_seeds
+                plan += [episode_key(m, c, history, task, s, a, arm["reasoning_effort"],
+                                     arm["reasoning_max_tokens"], arm["max_output_tokens"])
+                         for c in task_conditions for s in task_seeds for a in range(1, k + 1)]
     return plan
 
 
@@ -128,10 +147,11 @@ def write_summaries(rows, results_dir):
 
 def run_one(key, depth, max_decisions, cost_limit, llm=None, raw_dir=RAW_DIR,
             episode_timeout=600, progress=True):
-    model, condition, history, task, seed, attempt, reasoning_max_tokens, max_output_tokens = key
+    (model, condition, history, task, seed, attempt,
+     reasoning_effort, reasoning_max_tokens, max_output_tokens) = key
     run_id = (f"{RUN_PREFIX}{condition}-{model.replace('/', '_')}-{task}-{history}-s{seed}"
-              f"-k{attempt}-r{reasoning_max_tokens}-o{max_output_tokens}")
-    budgets = {"reasoning_max_tokens": reasoning_max_tokens, "max_output_tokens": max_output_tokens}
+              f"-k{attempt}-e{reasoning_effort}-r{reasoning_max_tokens}-o{max_output_tokens}")
+    budgets = thinking_arm(reasoning_effort, reasoning_max_tokens, max_output_tokens)
     if condition == "A":
         return run_episode_raw(model, seed, depth=depth, llm=llm, run_id=run_id, raw_dir=raw_dir,
                                episode_timeout=episode_timeout, progress=progress, **budgets)
@@ -153,38 +173,45 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
                   llm_factory=None, out=print, episode_timeout=600, progress=True,
                   reasoning_max_tokens=DEFAULT_REASONING_MAX_TOKENS,
                   max_output_tokens=DEFAULT_MAX_OUTPUT_TOKENS, tasks=("full",),
-                  stage_seeds=()):
-    """llm_factory(model) -> llm lets tests run without the network."""
+                  stage_seeds=(), reasoning_effort=DEFAULT_REASONING_EFFORT, thinking_arms=None):
+    """llm_factory(model) -> llm lets tests run without the network.
+
+    thinking_arms: reasoning efforts to run every episode under (e.g.
+    ["low", None]); None means just `reasoning_effort`. reasoning_max_tokens
+    can only go with an effort of None (unset)."""
+    efforts = thinking_arms if thinking_arms is not None else [reasoning_effort]
+    arms = [thinking_arm(e, reasoning_max_tokens if e is None else None, max_output_tokens)
+            for e in efforts]
     results_dir = Path(results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     episodes_path = results_dir / "episodes.jsonl"
 
     completed = load_completed(episodes_path)
     done = {row_key(r) for r in completed}
-    plan = plan_episodes(models, conditions, seeds, k, history, reasoning_max_tokens,
-                         max_output_tokens, tasks, stage_seeds)
+    plan = plan_episodes(models, conditions, seeds, k, history, arms, tasks, stage_seeds)
     todo = [key for key in plan if key not in done]
 
     runs = read_raw_logs(raw_dir)
     estimates = cost_estimates(runs)
     spent = benchmark_spend(runs)
 
-    out(f"budgets: reasoning_max_tokens={reasoning_max_tokens}, max_output_tokens={max_output_tokens}")
+    out("thinking arms: " + "; ".join(describe_arm(a) for a in arms))
     out(f"planned {len(plan)} episodes; {len(plan) - len(todo)} already done; {len(todo)} to run")
     if dry_run:
         groups = defaultdict(int)
-        for model, condition, *_ in todo:
-            groups[(model, condition)] += 1
+        for model, condition, _, _, _, _, effort, *_ in todo:
+            groups[(model, condition, str(effort))] += 1
         total, missing = 0.0, []
-        out(f"\n{'model':<45}{'cond':>5}{'episodes':>10}{'$/episode':>11}{'est. $':>10}")
-        for (model, condition), n in sorted(groups.items()):
-            est = estimates.get((model, condition))
+        out(f"\n{'model':<45}{'cond':>5}{'effort':>8}{'episodes':>10}{'$/episode':>11}{'est. $':>10}")
+        for (model, condition, effort), n in sorted(groups.items()):
+            est = estimates.get((model, condition))  # not per thinking arm
             if est is None:
-                missing.append(f"{model} {condition}")
-                out(f"{model:<45}{condition:>5}{n:>10}{'missing':>11}{'?':>10}")
+                if f"{model} {condition}" not in missing:
+                    missing.append(f"{model} {condition}")
+                out(f"{model:<45}{condition:>5}{effort:>8}{n:>10}{'missing':>11}{'?':>10}")
             else:
                 total += est * n
-                out(f"{model:<45}{condition:>5}{n:>10}{est:>11.4f}{est * n:>10.4f}")
+                out(f"{model:<45}{condition:>5}{effort:>8}{n:>10}{est:>11.4f}{est * n:>10.4f}")
         out(f"\nestimated cost of remaining episodes: ${total:.4f}"
             + (" (excluding missing estimates)" if missing else ""))
         out(f"benchmark spend logged so far: ${spent:.4f}")
@@ -194,7 +221,7 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
         return completed
 
     for i, key in enumerate(todo, 1):
-        model, condition, history_, task, seed, attempt, *_ = key
+        model, condition, history_, task, seed, attempt, effort, *_ = key
         est = estimates.get((model, condition))
         cost_limit = None
         if max_cost is not None:
@@ -211,7 +238,7 @@ def run_benchmark(models, conditions, seeds, k=1, history="window", depth=25, ma
         summary = run_one(key, depth, max_decisions, cost_limit, llm=llm, raw_dir=raw_dir,
                           episode_timeout=episode_timeout, progress=progress)
         spent += summary["total_cost_usd"]
-        out(f"[{i}/{len(todo)}] {condition} {task} {model} seed {seed} k{attempt}: "
+        out(f"[{i}/{len(todo)}] {condition} {task} {model} effort={effort} seed {seed} k{attempt}: "
             f"target_reached={summary['target_reached']} max_stage={summary['max_stage']} "
             f"${summary['total_cost_usd']:.4f} ({summary['stop_reason']}); spent ${spent:.4f}")
 
@@ -235,6 +262,56 @@ def token_budget(text):
     return None if text.lower() == "none" else int(text)
 
 
+def effort_arg(text):
+    """--reasoning-effort / --thinking-arms value: low, none, or unset (None)."""
+    if text == "unset":
+        return None
+    if text not in REASONING_EFFORTS:
+        raise argparse.ArgumentTypeError(
+            f"reasoning effort must be one of {', '.join(REASONING_EFFORTS)}, unset; got {text!r}")
+    return text
+
+
+def describe_arm(arm):
+    if arm["reasoning_effort"] is not None:
+        thinking = f"effort {arm['reasoning_effort']}"
+    elif arm["reasoning_max_tokens"] is not None:
+        thinking = f"reasoning max_tokens {arm['reasoning_max_tokens']}"
+    else:
+        thinking = "no reasoning setting"
+    return f"{thinking}, output cap {arm['max_output_tokens']}"
+
+
+_EFFORT_NOT_GIVEN = object()  # argparse would run a string default through effort_arg
+
+
+def add_thinking_args(p, arms=False):
+    """Shared by benchmark.py and smoke.py."""
+    p.add_argument("--reasoning-effort", type=effort_arg, default=_EFFORT_NOT_GIVEN,
+                   help=f"low, none or unset (default {DEFAULT_REASONING_EFFORT}; "
+                        "unset if --reasoning-max-tokens is given)")
+    if arms:
+        p.add_argument("--thinking-arms", type=lambda t: [effort_arg(x.strip()) for x in t.split(",")],
+                       help="run every episode under each of these efforts, e.g. low,none")
+    p.add_argument("--reasoning-max-tokens", type=token_budget, default=DEFAULT_REASONING_MAX_TOKENS,
+                   help="reasoning token budget instead of an effort (not the default); "
+                        "0 asks for no reasoning")
+    p.add_argument("--max-output-tokens", type=token_budget, default=DEFAULT_MAX_OUTPUT_TOKENS,
+                   help=f"output cap per call, reasoning included (default "
+                        f"{DEFAULT_MAX_OUTPUT_TOKENS}); 'none' sends no cap")
+
+
+def resolve_effort(p, a):
+    """The effort to use: the default, unless --reasoning-max-tokens asks for
+    a token budget instead. Both set explicitly is an error."""
+    if a.reasoning_effort is _EFFORT_NOT_GIVEN:
+        return None if a.reasoning_max_tokens is not None else DEFAULT_REASONING_EFFORT
+    if a.reasoning_effort is not None and a.reasoning_max_tokens is not None:
+        p.error("--reasoning-effort and --reasoning-max-tokens can't be combined; "
+                "use --reasoning-effort unset with a token budget")
+    return a.reasoning_effort
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--models", nargs="+", required=True)
@@ -252,17 +329,18 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--episode-timeout", type=float, default=600, help="seconds per episode")
     p.add_argument("--quiet", action="store_true", help="no per-decision progress lines")
-    p.add_argument("--reasoning-max-tokens", type=token_budget, default=DEFAULT_REASONING_MAX_TOKENS,
-                   help="reasoning budget per call; 0 asks for no reasoning, 'none' sends no setting")
-    p.add_argument("--max-output-tokens", type=token_budget, default=DEFAULT_MAX_OUTPUT_TOKENS,
-                   help="output cap per call, reasoning included; 'none' sends no cap")
+    add_thinking_args(p, arms=True)
     a = p.parse_args()
+    effort = resolve_effort(p, a)
+    if a.thinking_arms and a.reasoning_max_tokens is not None and any(a.thinking_arms):
+        p.error("--reasoning-max-tokens only goes with the 'unset' thinking arm")
     run_benchmark(a.models, a.conditions, parse_seeds(a.seeds), a.k, a.history, a.depth,
                   a.max_decisions, a.max_cost, a.dry_run,
                   episode_timeout=a.episode_timeout, progress=not a.quiet,
                   reasoning_max_tokens=a.reasoning_max_tokens,
                   max_output_tokens=a.max_output_tokens, tasks=parse_tasks(a.tasks),
-                  stage_seeds=parse_seeds(a.stage_seeds))
+                  stage_seeds=parse_seeds(a.stage_seeds), reasoning_effort=effort,
+                  thinking_arms=a.thinking_arms)
 
 
 if __name__ == "__main__":
